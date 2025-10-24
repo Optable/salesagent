@@ -108,8 +108,7 @@ from src.core.schemas import (
     VerifyTaskResponse,
 )
 from src.core.schemas_generated._schemas_v1_media_buy_get_products_request_json import (
-    GetProductsRequest1,
-    GetProductsRequest2,
+    GetProductsRequest as GetProductsRequestGenerated,
 )
 from src.services.policy_check_service import PolicyCheckService, PolicyStatus
 from src.services.setup_checklist_service import SetupIncompleteError, validate_setup_complete
@@ -137,6 +136,41 @@ class ApproveAdaptationRequest(BaseModel):
 class ApproveAdaptationResponse(BaseModel):
     success: bool
     message: str
+
+
+def run_async_in_sync_context(coroutine):
+    """
+    Helper to run async coroutines from sync code, handling event loop conflicts.
+
+    This is needed when calling async functions from sync code that may be called
+    from an async context (like FastMCP tools). It detects if there's already a
+    running event loop and uses a thread pool to avoid "asyncio.run() cannot be
+    called from a running event loop" errors.
+
+    Args:
+        coroutine: The async coroutine to run
+
+    Returns:
+        The result of the coroutine
+    """
+    import asyncio
+    import concurrent.futures
+
+    try:
+        # Check if there's already a running event loop
+        asyncio.get_running_loop()
+        # We're in an async context, run in thread pool to avoid nested loop error
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(lambda: asyncio.run(coroutine))
+            return future.result()
+    except RuntimeError:
+        # No running loop, safe to create one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coroutine)
+        finally:
+            loop.close()
 
 
 def safe_parse_json_field(field_value, field_name="field", default=None):
@@ -366,79 +400,181 @@ def get_push_notification_config_from_headers(headers: dict[str, str] | None) ->
     }
 
 
-def get_principal_from_context(context: Context | None) -> str | None:
-    """Extract principal ID from the FastMCP context using x-adcp-auth header.
+def get_principal_from_context(
+    context: Context | None, require_valid_token: bool = True
+) -> tuple[str | None, dict | None]:
+    """Extract principal ID and tenant context from the FastMCP context using x-adcp-auth header.
 
     Uses the current recommended FastMCP pattern with get_http_headers().
     Falls back to context.meta["headers"] for sync tools where get_http_headers() may return empty dict.
     Requires FastMCP >= 2.11.0.
-    """
-    if not context:
-        return None
 
+    Args:
+        context: FastMCP context object
+        require_valid_token: If True (default), raises error for invalid tokens.
+                           If False, treats invalid tokens like missing tokens (for discovery endpoints).
+
+    Returns:
+        tuple[principal_id, tenant_context]: Principal ID and tenant dict, or (None, tenant) if no/invalid auth
+
+    Note: Returns tenant context explicitly because ContextVar changes in sync functions
+    don't reliably propagate to async callers (Python ContextVar + async/sync boundary issue).
+    The caller MUST call set_current_tenant(tenant_context) in their own context.
+    """
     # Get headers using the recommended FastMCP approach
+    # NOTE: get_http_headers() works via context vars, so it can work even when context=None
+    # This allows unauthenticated public discovery endpoints to detect tenant from headers
+    # CRITICAL: Use include_all=True to get Host header (excluded by default)
+    import logging as log_module
+    import sys
+
+    # URGENT DEBUG: Use logger.error() to ensure visibility in production logs
+    debug_logger = log_module.getLogger(__name__)
+    debug_logger.error(f"🔍 get_principal_from_context called: context={context}, type={type(context)}")
+    if context:
+        debug_logger.error(f"🔍 context attributes: {dir(context)[:10]}...")  # First 10 attrs
+        if hasattr(context, "meta"):
+            debug_logger.error(f"🔍 context.meta exists: {context.meta}")
+        if hasattr(context, "headers"):
+            try:
+                headers_len = len(context.headers) if context.headers else 0
+                debug_logger.error(f"🔍 context.headers exists: {headers_len} headers")
+            except (TypeError, AttributeError):
+                debug_logger.error(f"🔍 context.headers exists but not iterable: {type(context.headers)}")
+
     headers = None
     try:
-        headers = get_http_headers()
-    except Exception:
+        headers = get_http_headers(include_all=True)
+        debug_logger.error(f"🔍 get_http_headers() returned: {len(headers) if headers else 0} headers")
+        if headers:
+            debug_logger.error(f"🔍 Header keys: {list(headers.keys())}")
+        print(
+            f"[PRINCIPAL DEBUG] get_http_headers(include_all=True) returned {len(headers) if headers else 0} headers",
+            file=sys.stderr,
+            flush=True,
+        )
+        console.print(
+            f"[blue]DEBUG: get_http_headers(include_all=True) returned {len(headers) if headers else 0} headers[/blue]"
+        )
+        if headers:
+            print(f"[PRINCIPAL DEBUG] Header keys: {list(headers.keys())}", file=sys.stderr, flush=True)
+            console.print(f"[blue]DEBUG: Header keys: {list(headers.keys())}[/blue]")
+    except Exception as e:
+        debug_logger.error(f"🔍 get_http_headers() exception: {type(e).__name__}: {e}")
+        print(f"[PRINCIPAL DEBUG] get_http_headers() exception: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        console.print(f"[yellow]DEBUG: get_http_headers() exception: {type(e).__name__}: {e}[/yellow]")
         pass  # Will try fallback below
 
     # If get_http_headers() returned empty dict or None, try context.meta fallback
     # This is necessary for sync tools where get_http_headers() may not work
     # CRITICAL: get_http_headers() returns {} for sync tools, so we need fallback even for empty dict
     if not headers:  # Handles both None and {}
-        if hasattr(context, "meta") and context.meta and "headers" in context.meta:
-            headers = context.meta["headers"]
-        # Try other possible attributes
-        elif hasattr(context, "headers"):
-            headers = context.headers
-        elif hasattr(context, "_headers"):
-            headers = context._headers
+        debug_logger.error(f"🔍 get_http_headers() empty, trying fallback - context is {type(context)}")
+        print("[PRINCIPAL DEBUG] get_http_headers() empty, trying fallback methods", file=sys.stderr, flush=True)
+        print(f"[PRINCIPAL DEBUG] context={context}, type={type(context)}", file=sys.stderr, flush=True)
+        console.print("[yellow]DEBUG: get_http_headers() empty, trying fallback methods[/yellow]")
+        # Only try context fallbacks if context is not None
+        if context is not None:
+            print(f"[PRINCIPAL DEBUG] hasattr(context, 'meta')={hasattr(context, 'meta')}", file=sys.stderr, flush=True)
+            if hasattr(context, "meta"):
+                print(f"[PRINCIPAL DEBUG] context.meta={context.meta}", file=sys.stderr, flush=True)
+                debug_logger.error(f"🔍 context.meta={context.meta}")
+            if hasattr(context, "meta") and context.meta and "headers" in context.meta:
+                headers = context.meta["headers"]
+                debug_logger.error(f"🔍 ✅ Got {len(headers)} headers from context.meta!")
+                print(f"[PRINCIPAL DEBUG] Got {len(headers)} headers from context.meta", file=sys.stderr, flush=True)
+                console.print(f"[blue]DEBUG: Got {len(headers)} headers from context.meta[/blue]")
+            # Try other possible attributes
+            elif hasattr(context, "headers"):
+                headers = context.headers
+                debug_logger.error(f"🔍 ✅ Got {len(headers)} headers from context.headers!")
+                print(f"[PRINCIPAL DEBUG] Got {len(headers)} headers from context.headers", file=sys.stderr, flush=True)
+                console.print(f"[blue]DEBUG: Got {len(headers)} headers from context.headers[/blue]")
+            elif hasattr(context, "_headers"):
+                headers = context._headers
+                debug_logger.error(f"🔍 ✅ Got {len(headers)} headers from context._headers!")
+                print(
+                    f"[PRINCIPAL DEBUG] Got {len(headers)} headers from context._headers", file=sys.stderr, flush=True
+                )
+                console.print(f"[blue]DEBUG: Got {len(headers)} headers from context._headers[/blue]")
+            else:
+                debug_logger.error("🔍 ❌ No fallback attributes (meta/headers/_headers) available on context")
+                print("[PRINCIPAL DEBUG] No fallback attributes available", file=sys.stderr, flush=True)
+                console.print(
+                    "[yellow]DEBUG: No fallback attributes available (context provided but no headers)[/yellow]"
+                )
+        else:
+            debug_logger.error("🔍 ❌ context=None and get_http_headers() failed")
+            print("[PRINCIPAL DEBUG] context=None", file=sys.stderr, flush=True)
+            console.print("[yellow]DEBUG: context=None and get_http_headers() failed - no headers available[/yellow]")
 
     # If still no headers dict available, return None
     if not headers:
-        return None
-
-    # Get the x-adcp-auth header (case-insensitive lookup)
-    auth_token = _get_header_case_insensitive(headers, "x-adcp-auth")
+        debug_logger.error("🔍 ❌ FINAL: No headers available - cannot detect tenant - returning (None, None)")
+        print("[PRINCIPAL DEBUG] ❌ CRITICAL: No headers available - cannot detect tenant", file=sys.stderr, flush=True)
+        console.print("[red]❌ CRITICAL: No headers available - cannot detect tenant[/red]")
+        return (None, None)
 
     # Log all relevant headers for debugging
+    import logging
+
+    logger = logging.getLogger(__name__)
+
     host_header = _get_header_case_insensitive(headers, "host")
     apx_host_header = _get_header_case_insensitive(headers, "apx-incoming-host")
     tenant_header = _get_header_case_insensitive(headers, "x-adcp-tenant")
+
+    logger.info("=" * 80)
+    logger.info("TENANT DETECTION - Auth Headers Debug:")
+    logger.info(f"  Host: {host_header}")
+    logger.info(f"  Apx-Incoming-Host: {apx_host_header}")
+    logger.info(f"  x-adcp-tenant: {tenant_header}")
+    logger.info(f"  Total headers available: {len(headers)}")
+    logger.info("=" * 80)
+
     console.print("[blue]Auth Headers Debug:[/blue]")
     console.print(f"  Host: {host_header}")
     console.print(f"  Apx-Incoming-Host: {apx_host_header}")
     console.print(f"  x-adcp-tenant: {tenant_header}")
-    console.print(f"  x-adcp-auth: {'Present' if auth_token else 'Missing'}")
 
-    if not auth_token:
-        console.print("[yellow]No x-adcp-auth token found - OK for discovery endpoints[/yellow]")
-        return None  # No auth provided - this is OK for discovery endpoints
-
-    # Check if a specific tenant was requested via header or subdomain
+    # ALWAYS resolve tenant from headers first (even without auth for public discovery endpoints)
     requested_tenant_id = None
     tenant_context = None
     detection_method = None
 
-    # 1. Check host header for subdomain FIRST (most common case)
+    # 1. Check host header - try virtual host FIRST, then fall back to subdomain
     if not requested_tenant_id:
         host = _get_header_case_insensitive(headers, "host") or ""
-        subdomain = host.split(".")[0] if "." in host else None
-        console.print(f"[blue]Extracted subdomain from Host header: {subdomain}[/blue]")
-        if subdomain and subdomain not in ["localhost", "adcp-sales-agent", "www", "admin"]:
-            # Look up tenant by subdomain to get actual tenant_id
-            console.print(f"[blue]Looking up tenant by subdomain: {subdomain}[/blue]")
-            tenant_context = get_tenant_by_subdomain(subdomain)
-            if tenant_context:
-                requested_tenant_id = tenant_context["tenant_id"]
-                detection_method = "subdomain"
-                set_current_tenant(tenant_context)
-                console.print(
-                    f"[green]Tenant detected from subdomain: {subdomain} → tenant_id: {requested_tenant_id}[/green]"
-                )
-            else:
-                console.print(f"[yellow]No tenant found for subdomain: {subdomain}[/yellow]")
+        console.print(f"[blue]Checking Host header: {host}[/blue]")
+
+        # CRITICAL: Try virtual host lookup FIRST before extracting subdomain
+        # This prevents issues where a subdomain happens to match a virtual host
+        # (e.g., "test-agent" subdomain vs "test-agent.adcontextprotocol.org" virtual host)
+        tenant_context = get_tenant_by_virtual_host(host)
+        if tenant_context:
+            requested_tenant_id = tenant_context["tenant_id"]
+            detection_method = "host header (virtual host)"
+            set_current_tenant(tenant_context)
+            console.print(
+                f"[green]Tenant detected from Host header virtual host: {host} → tenant_id: {requested_tenant_id}[/green]"
+            )
+        else:
+            # Fallback to subdomain extraction if virtual host lookup failed
+            subdomain = host.split(".")[0] if "." in host else None
+            console.print(f"[blue]No virtual host match, extracting subdomain from Host header: {subdomain}[/blue]")
+            if subdomain and subdomain not in ["localhost", "adcp-sales-agent", "www", "admin"]:
+                # Look up tenant by subdomain to get actual tenant_id
+                console.print(f"[blue]Looking up tenant by subdomain: {subdomain}[/blue]")
+                tenant_context = get_tenant_by_subdomain(subdomain)
+                if tenant_context:
+                    requested_tenant_id = tenant_context["tenant_id"]
+                    detection_method = "subdomain"
+                    set_current_tenant(tenant_context)
+                    console.print(
+                        f"[green]Tenant detected from subdomain: {subdomain} → tenant_id: {requested_tenant_id}[/green]"
+                    )
+                else:
+                    console.print(f"[yellow]No tenant found for subdomain: {subdomain}[/yellow]")
 
     # 2. Check x-adcp-tenant header (set by nginx for path-based routing)
     if not requested_tenant_id:
@@ -469,38 +605,77 @@ def get_principal_from_context(context: Context | None) -> str | None:
     # 3. Check Apx-Incoming-Host header (for Approximated.app virtual hosts)
     if not requested_tenant_id:
         apx_host = _get_header_case_insensitive(headers, "apx-incoming-host")
+        console.print(f"[blue]Checking Apx-Incoming-Host header: {apx_host}[/blue]")
         if apx_host:
-            console.print(f"[blue]Looking up tenant by virtual host: {apx_host}[/blue]")
+            console.print(f"[blue]Looking up tenant by virtual host (via Apx-Incoming-Host): {apx_host}[/blue]")
             tenant_context = get_tenant_by_virtual_host(apx_host)
+            console.print(f"[blue]get_tenant_by_virtual_host() returned: {tenant_context}[/blue]")
             if tenant_context:
                 requested_tenant_id = tenant_context["tenant_id"]
                 detection_method = "apx-incoming-host"
                 # Set tenant context immediately for virtual host routing
                 set_current_tenant(tenant_context)
-                console.print(f"[green]Tenant detected from Apx-Incoming-Host: {requested_tenant_id}[/green]")
+                console.print(f"[green]✅ Tenant detected from Apx-Incoming-Host: {requested_tenant_id}[/green]")
+            else:
+                console.print(f"[yellow]⚠️ No tenant found for virtual host: {apx_host}[/yellow]")
+        else:
+            console.print("[yellow]Apx-Incoming-Host header not present[/yellow]")
 
     if not requested_tenant_id:
-        console.print("[yellow]No tenant detected from any source - will use global token lookup[/yellow]")
+        console.print("[yellow]No tenant detected from headers[/yellow]")
     else:
         console.print(f"[bold green]Final tenant_id: {requested_tenant_id} (via {detection_method})[/bold green]")
 
+    # NOW check for auth token (after tenant resolution)
+    auth_token = _get_header_case_insensitive(headers, "x-adcp-auth")
+    console.print(f"  x-adcp-auth: {'Present' if auth_token else 'Missing'}")
+
+    if not auth_token:
+        console.print("[yellow]No x-adcp-auth token found - OK for discovery endpoints[/yellow]")
+        # Return tenant context without auth for public discovery endpoints
+        return (None, tenant_context)
+
     # Validate token and get principal
-    # If a specific tenant was requested, validate against it
-    # Otherwise, look up by token alone and set tenant context
+    # If requested_tenant_id is set: validate token belongs to that specific tenant
+    # If requested_tenant_id is None: do global lookup and set tenant context from token
+    if not requested_tenant_id:
+        # No tenant detected from headers - use global token lookup
+        # SECURITY NOTE: This is safe because get_principal_from_token() will:
+        # 1. Look up the token globally
+        # 2. Find which tenant it belongs to
+        # 3. Set that tenant's context
+        # 4. Return principal_id only if token is valid for that tenant
+        console.print("[yellow]Using global token lookup (finds tenant from token)[/yellow]")
+        detection_method = "global token lookup"
+
     principal_id = get_principal_from_token(auth_token, requested_tenant_id)
 
-    # If token was provided but invalid, raise an error
-    # This distinguishes between "no auth" (OK) and "bad auth" (error)
+    # If token was provided but invalid, raise an error (unless require_valid_token=False for discovery)
+    # This distinguishes between "no auth" (OK) and "bad auth" (error or warning)
     if principal_id is None:
-        from fastmcp.exceptions import ToolError
+        if require_valid_token:
+            from fastmcp.exceptions import ToolError
 
-        raise ToolError(
-            "INVALID_AUTH_TOKEN",
-            f"Authentication token is invalid for tenant '{requested_tenant_id or 'any'}'. "
-            f"The token may be expired, revoked, or associated with a different tenant.",
-        )
+            raise ToolError(
+                "INVALID_AUTH_TOKEN",
+                f"Authentication token is invalid for tenant '{requested_tenant_id or 'any'}'. "
+                f"The token may be expired, revoked, or associated with a different tenant.",
+            )
+        else:
+            # For discovery endpoints, treat invalid token like missing token
+            console.print(
+                f"[yellow]Invalid token for tenant '{requested_tenant_id or 'any'}' - continuing without auth (discovery endpoint)[/yellow]"
+            )
+            return (None, tenant_context)
 
-    return principal_id
+    # If tenant_context wasn't set by header detection, get it from current tenant
+    # (get_principal_from_token set it as a side effect for global lookup case)
+    if not tenant_context:
+        tenant_context = get_current_tenant()
+
+    # Return both principal_id and tenant_context explicitly
+    # Caller MUST call set_current_tenant(tenant_context) in their async context
+    return (principal_id, tenant_context)
 
 
 def get_principal_adapter_mapping(principal_id: str) -> dict[str, Any]:
@@ -631,8 +806,8 @@ try:
     config = load_config()
 except (RuntimeError, Exception) as e:
     # Use minimal config for test environments or when DB is unavailable
-    # This handles both "No tenant in context" and database connection errors
-    if "No tenant in context" in str(e) or "connection" in str(e).lower() or "operational" in str(e).lower():
+    # This handles both "No tenant context set" and database connection errors
+    if "No tenant context" in str(e) or "connection" in str(e).lower() or "operational" in str(e).lower():
         config = {
             "creative_engine": {},
             "dry_run": False,
@@ -644,8 +819,9 @@ except (RuntimeError, Exception) as e:
 
 mcp = FastMCP(
     name="AdCPSalesAgent",
-    # Use stateless HTTP mode to avoid session requirements
-    stateless_http=True,
+    # Enable sessions to allow proper HTTP context for header access
+    # This is needed for tenant detection via headers in unauthenticated calls
+    stateless_http=False,
 )
 
 # Initialize creative engine with minimal config (will be tenant-specific later)
@@ -762,6 +938,58 @@ def _normalize_format_value(format_value: Any) -> str:
     return format_id
 
 
+def _validate_creative_assets(assets: Any) -> dict[str, dict[str, Any]] | None:
+    """Validate that creative assets are in AdCP v2.1+ dictionary format.
+
+    AdCP v2.1+ requires assets to be a dictionary keyed by asset_id from the format's
+    asset_requirements.
+
+    Args:
+        assets: Assets in dict format keyed by asset_id, or None
+
+    Returns:
+        Dictionary of assets keyed by asset_id, or None if no assets provided
+
+    Raises:
+        ValueError: If assets are not in the correct dict format, or if asset structure is invalid
+
+    Example:
+        # Correct format (AdCP v2.1+)
+        assets = {
+            "main_image": {"asset_type": "image", "url": "https://..."},
+            "logo": {"asset_type": "image", "url": "https://..."}
+        }
+    """
+    if assets is None:
+        return None
+
+    # Must be a dict
+    if not isinstance(assets, dict):
+        raise ValueError(
+            f"Invalid assets format: expected dict keyed by asset_id (AdCP v2.1+), got {type(assets).__name__}. "
+            f"Assets must be a dictionary like: {{'main_image': {{'asset_type': 'image', 'url': '...'}}}}"
+        )
+
+    # Validate structure of each asset
+    for asset_id, asset_data in assets.items():
+        # Asset ID must be a non-empty string
+        if not isinstance(asset_id, str):
+            raise ValueError(
+                f"Asset key must be a string (asset_id from format), got {type(asset_id).__name__}: {asset_id!r}"
+            )
+        if not asset_id.strip():
+            raise ValueError("Asset key (asset_id) cannot be empty or whitespace-only")
+
+        # Asset data must be a dict
+        if not isinstance(asset_data, dict):
+            raise ValueError(
+                f"Asset '{asset_id}' data must be a dict, got {type(asset_data).__name__}. "
+                f"Expected format: {{'asset_type': '...', 'url': '...', ...}}"
+            )
+
+    return assets
+
+
 def _convert_creative_to_adapter_asset(creative: Creative, package_assignments: list[str]) -> dict[str, Any]:
     """Convert AdCP v1.3+ Creative object to format expected by ad server adapters."""
 
@@ -851,7 +1079,11 @@ def _get_principal_id_from_context(context: Context) -> str:
         return context.principal_id
 
     # Otherwise, extract from FastMCP Context headers
-    principal_id = get_principal_from_context(context)
+    principal_id, tenant = get_principal_from_context(context)
+
+    # Set tenant context if returned (sync function so ContextVar should propagate)
+    if tenant:
+        set_current_tenant(tenant)
 
     # Extract headers for debugging
     headers = {}
@@ -866,7 +1098,7 @@ def _get_principal_id_from_context(context: Context) -> str:
             raise ToolError(
                 f"Missing x-adcp-auth header. "
                 f"Apx-Incoming-Host: {apx_host}, "
-                f"Tenant: {get_current_tenant().get('tenant_id') if get_current_tenant() else 'NONE'}"
+                f"Tenant: {tenant.get('tenant_id') if tenant else 'NONE'}"
             )
         else:
             # Header present but invalid (token not found in DB)
@@ -932,12 +1164,17 @@ def _verify_principal(media_buy_id: str, context: Context):
 def log_tool_activity(context: Context, tool_name: str, start_time: float = None):
     """Log tool activity to the activity feed."""
     try:
-        tenant = get_current_tenant()
+        # Get principal and tenant context
+        principal_id, tenant = get_principal_from_context(context)
+
+        # Set tenant context if returned
+        if tenant:
+            set_current_tenant(tenant)
+        else:
+            tenant = get_current_tenant()
+
         if not tenant:
             return
-
-        # Get principal name
-        principal_id = get_principal_from_context(context)
         principal_name = "Unknown"
 
         if principal_id:
@@ -983,14 +1220,14 @@ def log_tool_activity(context: Context, tool_name: str, start_time: float = None
 # --- MCP Tools (Full Implementation) ---
 
 
-async def _get_products_impl(req: GetProductsRequest1 | GetProductsRequest2, context: Context) -> GetProductsResponse:
+async def _get_products_impl(req: GetProductsRequestGenerated, context: Context) -> GetProductsResponse:
     """Shared implementation for get_products.
 
     Contains all business logic for product discovery including policy checks,
     product catalog providers, dynamic pricing, and filtering.
 
     Args:
-        req: GetProductsRequest variant (GetProductsRequest1 or GetProductsRequest2)
+        req: GetProductsRequest from generated schemas
         context: FastMCP Context for tenant/principal resolution
 
     Returns:
@@ -1000,7 +1237,7 @@ async def _get_products_impl(req: GetProductsRequest1 | GetProductsRequest2, con
 
     print("=" * 80, file=sys.stderr, flush=True)
     print(
-        f"🔧 _get_products_impl CALLED: req={req.promoted_offering}, brief={req.brief[:50] if req.brief else 'N/A'}",
+        f"🔧 _get_products_impl CALLED: brand_manifest={req.brand_manifest}, brief={req.brief[:50] if req.brief else 'N/A'}",
         file=sys.stderr,
         flush=True,
     )
@@ -1027,25 +1264,34 @@ async def _get_products_impl(req: GetProductsRequest1 | GetProductsRequest2, con
         # Legacy path - extract from FastMCP Context
         testing_ctx = get_testing_context(context)
         # For discovery endpoints, authentication is optional
+        # require_valid_token=False means invalid tokens are treated like missing tokens (discovery endpoint behavior)
         logger.info("[GET_PRODUCTS] About to call get_principal_from_context")
         print("🔍 [GET_PRODUCTS DEBUG] About to call get_principal_from_context", flush=True)
-        principal_id = get_principal_from_context(context)  # Returns None if no auth
-        logger.info(f"[GET_PRODUCTS] principal_id returned: {principal_id}")
-        print(f"🔍 [GET_PRODUCTS DEBUG] principal_id returned: {principal_id}", flush=True)
-        tenant = get_current_tenant()
-        logger.info(f"[GET_PRODUCTS] tenant returned: {tenant}")
-        print(f"🔍 [GET_PRODUCTS DEBUG] tenant returned: {tenant}", flush=True)
-        if not tenant:
-            logger.error("[GET_PRODUCTS] No tenant context available - raising ToolError")
-            print("❌ [GET_PRODUCTS DEBUG] No tenant context - raising ToolError", flush=True)
-            raise ToolError("No tenant context available")
+        principal_id, tenant = get_principal_from_context(
+            context, require_valid_token=False
+        )  # Returns (None, tenant) if no/invalid auth
+        logger.info(f"[GET_PRODUCTS] principal_id returned: {principal_id}, tenant: {tenant}")
+        print(f"🔍 [GET_PRODUCTS DEBUG] principal_id returned: {principal_id}, tenant: {tenant}", flush=True)
+
+        # Set tenant context explicitly in this async context (ContextVar propagation fix)
+        if tenant:
+            set_current_tenant(tenant)
+            logger.info(f"[GET_PRODUCTS] Set tenant context: {tenant['tenant_id']}")
+            print(f"🔍 [GET_PRODUCTS DEBUG] Set tenant context: {tenant['tenant_id']}", flush=True)
+        elif principal_id:
+            # If we have principal but no tenant, something went wrong
+            logger.error(f"[GET_PRODUCTS] Principal found but no tenant context: principal_id={principal_id}")
+            print("❌ [GET_PRODUCTS DEBUG] Principal found but no tenant context", flush=True)
+            raise ToolError(
+                f"Authentication succeeded but tenant context missing. " f"This is a bug. principal_id={principal_id}"
+            )
+        # else: No auth provided, which is OK for discovery endpoints
 
     # Get the Principal object with ad server mappings
     principal = get_principal_object(principal_id) if principal_id else None
     principal_data = principal.model_dump() if principal else None
 
-    # Extract offering text from brand_manifest or promoted_offering
-    # The validator ensures at least one is present
+    # Extract offering text from brand_manifest
     offering = None
     if req.brand_manifest:
         if isinstance(req.brand_manifest, str):
@@ -1059,45 +1305,16 @@ async def _get_products_impl(req: GetProductsRequest1 | GetProductsRequest2, con
                 offering = req.brand_manifest.name
             elif isinstance(req.brand_manifest, dict):
                 offering = req.brand_manifest.get("name", "")
-    elif req.promoted_offering:
-        offering = req.promoted_offering.strip()
 
     if not offering:
-        raise ToolError("Either brand_manifest or promoted_offering must provide brand information")
+        raise ToolError("brand_manifest must provide brand information")
 
     # Skip strict validation in test environments (allow simple test values)
     import os
 
     is_test_mode = (testing_ctx and testing_ctx.test_session_id is not None) or os.getenv("ADCP_TESTING") == "true"
 
-    # Only validate promoted_offering format (brand_manifest has its own structure)
-    if req.promoted_offering and not is_test_mode:
-        generic_terms = {
-            "footwear",
-            "shoes",
-            "clothing",
-            "apparel",
-            "electronics",
-            "food",
-            "beverages",
-            "automotive",
-            "athletic",
-        }
-        words = req.promoted_offering.split()
-
-        # Must have at least 2 words (brand + product)
-        if len(words) < 2:
-            raise ToolError(
-                f"Invalid promoted_offering: '{req.promoted_offering}'. Must include both brand and specific product "
-                f"(e.g., 'Nike Air Jordan 2025 basketball shoes', not just 'shoes')"
-            )
-
-        # Check if it's just generic category terms without a brand
-        if all(word.lower() in generic_terms or word.lower() in ["and", "or", "the", "a", "an"] for word in words):
-            raise ToolError(
-                f"Invalid promoted_offering: '{req.promoted_offering}'. Must include brand name and specific product, "
-                f"not just generic category (e.g., 'Nike Air Jordan 2025' not 'athletic footwear')"
-            )
+    # Note: brand_manifest validation is handled by Pydantic schema, no need for runtime validation here
 
     # Check policy compliance first (if enabled)
     advertising_policy = safe_parse_json_field(
@@ -1140,7 +1357,7 @@ async def _get_products_impl(req: GetProductsRequest1 | GetProductsRequest2, con
             try:
                 policy_result = await policy_service.check_brief_compliance(
                     brief=req.brief,
-                    promoted_offering=req.promoted_offering,
+                    promoted_offering=offering,  # Use extracted offering from brand_manifest
                     brand_manifest=brand_manifest_dict,
                     tenant_policies=tenant_policies if tenant_policies else None,
                 )
@@ -1155,11 +1372,7 @@ async def _get_products_impl(req: GetProductsRequest1 | GetProductsRequest2, con
                     success=policy_result.status != PolicyStatus.BLOCKED,
                     details={
                         "brief": req.brief[:100] + "..." if len(req.brief) > 100 else req.brief,
-                        "promoted_offering": (
-                            req.promoted_offering[:100] + "..."
-                            if req.promoted_offering and len(req.promoted_offering) > 100
-                            else req.promoted_offering
-                        ),
+                        "brand_name": offering[:100] + "..." if offering and len(offering) > 100 else offering,
                         "policy_status": policy_result.status,
                         "reason": policy_result.reason,
                         "restrictions": policy_result.restrictions,
@@ -1217,7 +1430,7 @@ async def _get_products_impl(req: GetProductsRequest1 | GetProductsRequest2, con
                 success=False,
                 details={
                     "brief": req.brief,
-                    "promoted_offering": req.promoted_offering,
+                    "brand_name": offering,
                     "policy_status": policy_result.status,
                     "restrictions": policy_result.restrictions,
                     "reason": policy_result.reason,
@@ -1269,7 +1482,7 @@ async def _get_products_impl(req: GetProductsRequest1 | GetProductsRequest2, con
 
     # Query products using the brief, including context for signals forwarding
     context_data = {
-        "promoted_offering": req.promoted_offering,
+        "brand_name": offering,
         "tenant_id": tenant["tenant_id"],
         "principal_id": principal_id,
     }
@@ -1488,9 +1701,8 @@ async def _get_products_impl(req: GetProductsRequest1 | GetProductsRequest2, con
     return GetProductsResponse(products=modified_products, status=status)
 
 
-@mcp.tool
+@mcp.tool()
 async def get_products(
-    promoted_offering: str | None = None,
     brand_manifest: Any | None = None,  # BrandManifest | str | None - validated by Pydantic
     brief: str = "",
     filters: dict | None = None,
@@ -1501,7 +1713,6 @@ async def get_products(
     MCP tool wrapper that delegates to the shared implementation.
 
     Args:
-        promoted_offering: DEPRECATED: Use brand_manifest instead (still supported for backward compatibility)
         brand_manifest: Brand information manifest (inline object or URL string)
         brief: Brief description of the advertising campaign or requirements (optional)
         filters: Structured filters for product discovery (optional)
@@ -1509,12 +1720,16 @@ async def get_products(
 
     Returns:
         GetProductsResponse containing matching products
+
+    Note:
+        promoted_offering is deprecated - use brand_manifest instead.
+        If you need backward compatibility, use the A2A interface which still supports it.
     """
     import sys
 
     print("=" * 80, file=sys.stderr, flush=True)
     print(
-        f"🚀 MCP get_products CALLED: offered={promoted_offering}, brief={brief[:50] if brief else 'N/A'}",
+        f"🚀 MCP get_products CALLED: brand_manifest={brand_manifest}, brief={brief[:50] if brief else 'N/A'}",
         file=sys.stderr,
         flush=True,
     )
@@ -1523,7 +1738,7 @@ async def get_products(
     # Build request object for shared implementation using helper
     try:
         req = create_get_products_request(
-            promoted_offering=promoted_offering,
+            promoted_offering=None,  # Not exposed in MCP tool (use brand_manifest)
             brief=brief,
             brand_manifest=brand_manifest,
             filters=filters,
@@ -1534,9 +1749,9 @@ async def get_products(
         # Convert ValueError from helper to ToolError with clear message
         raise ToolError(f"Invalid get_products request: {e}") from e
 
-    # Call shared implementation with unwrapped variant
-    # GetProductsRequest is a RootModel, so we pass req.root (the actual variant)
-    return await _get_products_impl(req.root, context)  # type: ignore[arg-type]
+    # Call shared implementation
+    # Note: GetProductsRequest is now a flat class (not RootModel), so pass req directly
+    return await _get_products_impl(req, context)
 
 
 def _list_creative_formats_impl(
@@ -1555,10 +1770,16 @@ def _list_creative_formats_impl(
         req = ListCreativeFormatsRequest()
 
     # For discovery endpoints, authentication is optional
-    principal_id = get_principal_from_context(context)  # Returns None if no auth
+    # require_valid_token=False means invalid tokens are treated like missing tokens (discovery endpoint behavior)
+    principal_id, tenant = get_principal_from_context(
+        context, require_valid_token=False
+    )  # Returns (None, tenant) if no/invalid auth
 
-    # Get tenant information
-    tenant = get_current_tenant()
+    # Set tenant context if returned
+    if tenant:
+        set_current_tenant(tenant)
+    else:
+        tenant = get_current_tenant()
     if not tenant:
         raise ToolError("No tenant context available")
 
@@ -1857,12 +2078,16 @@ def _sync_creatives_impl(
                 # Use savepoint for individual creative transaction isolation
                 with session.begin_nested():
                     # Check if creative already exists (always check for upsert/patch behavior)
+                    # SECURITY: Must filter by principal_id to prevent cross-principal modification
                     existing_creative = None
                     if creative.get("creative_id"):
                         from src.core.database.models import Creative as DBCreative
 
+                        # Query for existing creative with security filter
                         stmt = select(DBCreative).filter_by(
-                            tenant_id=tenant["tenant_id"], creative_id=creative.get("creative_id")
+                            tenant_id=tenant["tenant_id"],
+                            principal_id=principal_id,  # SECURITY: Prevent cross-principal modification
+                            creative_id=creative.get("creative_id"),
                         )
                         existing_creative = session.scalars(stmt).first()
 
@@ -2002,14 +2227,15 @@ def _sync_creatives_impl(
                             if creative_format:
                                 try:
                                     # Get format to find creative agent URL
-                                    import asyncio
 
                                     from src.core.creative_agent_registry import get_creative_agent_registry
 
                                     registry = get_creative_agent_registry()
 
                                     # List all formats to find the matching one
-                                    all_formats = asyncio.run(registry.list_all_formats(tenant_id=tenant["tenant_id"]))
+                                    all_formats = run_async_in_sync_context(
+                                        registry.list_all_formats(tenant_id=tenant["tenant_id"])
+                                    )
 
                                     # Find matching format
                                     format_obj = None
@@ -2088,7 +2314,7 @@ def _sync_creatives_impl(
                                                     f"context_id={context_id}"
                                                 )
 
-                                                build_result = asyncio.run(
+                                                build_result = run_async_in_sync_context(
                                                     registry.build_creative(
                                                         agent_url=format_obj.agent_url,
                                                         format_id=creative_format,
@@ -2146,30 +2372,45 @@ def _sync_creatives_impl(
                                         else:
                                             # Static creative - use preview_creative
                                             # Build creative manifest from available data
+                                            # Extract string ID from FormatId object if needed
+                                            format_id_str = (
+                                                creative_format.id
+                                                if hasattr(creative_format, "id")
+                                                else str(creative_format)
+                                            )
                                             creative_manifest = {
                                                 "creative_id": existing_creative.creative_id,
                                                 "name": creative.get("name") or existing_creative.name,
-                                                "format_id": creative_format,
+                                                "format_id": format_id_str,
                                             }
 
                                             # Add any provided asset data for validation
+                                            # Validate assets are in dict format (AdCP v2.4+)
                                             if creative.get("assets"):
-                                                creative_manifest["assets"] = creative.get("assets")
+                                                validated_assets = _validate_creative_assets(creative.get("assets"))
+                                                if validated_assets:
+                                                    creative_manifest["assets"] = validated_assets
                                             if data.get("url"):
                                                 creative_manifest["url"] = data.get("url")
 
                                             # Call creative agent's preview_creative for validation + preview
+                                            # Extract string ID from FormatId object if needed
+                                            format_id_str = (
+                                                creative_format.id
+                                                if hasattr(creative_format, "id")
+                                                else str(creative_format)
+                                            )
                                             logger.info(
                                                 f"[sync_creatives] Calling preview_creative for validation (update): "
-                                                f"{existing_creative.creative_id} format {creative_format} "
+                                                f"{existing_creative.creative_id} format {format_id_str} "
                                                 f"from agent {format_obj.agent_url}, has_assets={bool(creative.get('assets'))}, "
                                                 f"has_url={bool(data.get('url'))}"
                                             )
 
-                                            preview_result = asyncio.run(
+                                            preview_result = run_async_in_sync_context(
                                                 registry.preview_creative(
                                                     agent_url=format_obj.agent_url,
-                                                    format_id=creative_format,
+                                                    format_id=format_id_str,
                                                     creative_manifest=creative_manifest,
                                                 )
                                             )
@@ -2310,6 +2551,9 @@ def _sync_creatives_impl(
                         # Create new creative
                         from src.core.database.models import Creative as DBCreative
 
+                        # Extract creative_id for error reporting (must be defined before any validation)
+                        creative_id = creative.get("creative_id", "unknown")
+
                         # Prepare data field with all creative properties
                         data = {
                             "url": creative.get("url"),
@@ -2332,14 +2576,15 @@ def _sync_creatives_impl(
                         if creative_format:
                             try:
                                 # Get format to find creative agent URL
-                                import asyncio
 
                                 from src.core.creative_agent_registry import get_creative_agent_registry
 
                                 registry = get_creative_agent_registry()
 
                                 # List all formats to find the matching one
-                                all_formats = asyncio.run(registry.list_all_formats(tenant_id=tenant["tenant_id"]))
+                                all_formats = run_async_in_sync_context(
+                                    registry.list_all_formats(tenant_id=tenant["tenant_id"])
+                                )
 
                                 # Find matching format
                                 format_obj = None
@@ -2404,16 +2649,22 @@ def _sync_creatives_impl(
                                                     break
 
                                         # Call build_creative
+                                        # Extract string ID from FormatId object if needed
+                                        format_id_str = (
+                                            creative_format.id
+                                            if hasattr(creative_format, "id")
+                                            else str(creative_format)
+                                        )
                                         logger.info(
                                             f"[sync_creatives] Calling build_creative for generative format: "
-                                            f"{creative_format} from agent {format_obj.agent_url}, "
+                                            f"{format_id_str} from agent {format_obj.agent_url}, "
                                             f"message_length={len(message) if message else 0}"
                                         )
 
-                                        build_result = asyncio.run(
+                                        build_result = run_async_in_sync_context(
                                             registry.build_creative(
                                                 agent_url=format_obj.agent_url,
-                                                format_id=creative_format,
+                                                format_id=format_id_str,
                                                 message=message,
                                                 gemini_api_key=gemini_api_key,
                                                 promoted_offerings=promoted_offerings,
@@ -2457,29 +2708,44 @@ def _sync_creatives_impl(
                                     else:
                                         # Static creative - use preview_creative
                                         # Build creative manifest from available data
+                                        # Extract string ID from FormatId object if needed
+                                        format_id_str = (
+                                            creative_format.id
+                                            if hasattr(creative_format, "id")
+                                            else str(creative_format)
+                                        )
                                         creative_manifest = {
                                             "creative_id": creative.get("creative_id") or str(uuid.uuid4()),
                                             "name": creative.get("name"),
-                                            "format_id": creative_format,
+                                            "format_id": format_id_str,
                                         }
 
                                         # Add any provided asset data for validation
+                                        # Validate assets are in dict format (AdCP v2.4+)
                                         if creative.get("assets"):
-                                            creative_manifest["assets"] = creative.get("assets")
+                                            validated_assets = _validate_creative_assets(creative.get("assets"))
+                                            if validated_assets:
+                                                creative_manifest["assets"] = validated_assets
                                         if data.get("url"):
                                             creative_manifest["url"] = data.get("url")
 
                                         # Call creative agent's preview_creative for validation + preview
+                                        # Extract string ID from FormatId object if needed
+                                        format_id_str = (
+                                            creative_format.id
+                                            if hasattr(creative_format, "id")
+                                            else str(creative_format)
+                                        )
                                         logger.info(
-                                            f"[sync_creatives] Calling preview_creative for validation: {creative_format} "
+                                            f"[sync_creatives] Calling preview_creative for validation: {format_id_str} "
                                             f"from agent {format_obj.agent_url}, has_assets={bool(creative.get('assets'))}, "
                                             f"has_url={bool(data.get('url'))}"
                                         )
 
-                                        preview_result = asyncio.run(
+                                        preview_result = run_async_in_sync_context(
                                             registry.preview_creative(
                                                 agent_url=format_obj.agent_url,
-                                                format_id=creative_format,
+                                                format_id=format_id_str,
                                                 creative_manifest=creative_manifest,
                                             )
                                         )
@@ -2688,6 +2954,10 @@ def _sync_creatives_impl(
 
     # Process assignments (spec-compliant: creative_id → package_ids mapping)
     assignment_list = []
+    # Track assignments per creative for response population
+    assignments_by_creative: dict[str, list[str]] = {}  # creative_id -> [package_ids]
+    assignment_errors_by_creative: dict[str, dict[str, str]] = {}  # creative_id -> {package_id: error}
+
     # Note: assignments should be a dict, but handle both dict and None
     if assignments and isinstance(assignments, dict):
         with get_db_session() as session:
@@ -2696,33 +2966,51 @@ def _sync_creatives_impl(
             from src.core.schemas import CreativeAssignment
 
             for creative_id, package_ids in assignments.items():
+                # Initialize tracking for this creative
+                if creative_id not in assignments_by_creative:
+                    assignments_by_creative[creative_id] = []
+                if creative_id not in assignment_errors_by_creative:
+                    assignment_errors_by_creative[creative_id] = {}
+
                 for package_id in package_ids:
                     # Find which media buy this package belongs to
                     # Packages are stored in media_buy.raw_request["packages"]
+                    # Note: package_id can be either the server-generated package_id OR buyer_ref
                     stmt = select(MediaBuy).filter_by(tenant_id=tenant["tenant_id"])
                     media_buys = session.scalars(stmt).all()
 
                     media_buy_id = None
+                    actual_package_id = None
                     for mb in media_buys:
                         packages = mb.raw_request.get("packages", [])
-                        if any(pkg.get("package_id") == package_id for pkg in packages):
-                            media_buy_id = mb.media_buy_id
+                        # Check both package_id (server-generated) and buyer_ref (client-provided)
+                        for pkg in packages:
+                            if pkg.get("package_id") == package_id or pkg.get("buyer_ref") == package_id:
+                                media_buy_id = mb.media_buy_id
+                                # Use the server-generated package_id for storage
+                                actual_package_id = pkg.get("package_id", package_id)
+                                break
+                        if media_buy_id:
                             break
 
                     if not media_buy_id:
-                        # Package not found - skip if in lenient mode, error if strict
+                        # Package not found - record error
+                        error_msg = f"Package not found: {package_id}"
+                        assignment_errors_by_creative[creative_id][package_id] = error_msg
+
+                        # Skip if in lenient mode, error if strict
                         if validation_mode == "strict":
-                            raise ToolError(f"Package not found: {package_id}")
+                            raise ToolError(error_msg)
                         else:
                             logger.warning(f"Package not found during assignment: {package_id}, skipping")
                             continue
 
-                    # Create assignment
+                    # Create assignment in creative_assignments table
                     assignment = DBAssignment(
                         tenant_id=tenant["tenant_id"],
                         assignment_id=str(uuid.uuid4()),
                         media_buy_id=media_buy_id,
-                        package_id=package_id,
+                        package_id=actual_package_id,  # Use resolved package_id
                         creative_id=creative_id,
                         weight=100,
                         created_at=datetime.now(UTC),
@@ -2739,7 +3027,22 @@ def _sync_creatives_impl(
                         )
                     )
 
+                    # Track successful assignment
+                    assignments_by_creative[creative_id].append(actual_package_id)
+
             session.commit()
+
+    # Update creative results with assignment information (per AdCP spec)
+    for result in results:
+        if result.creative_id in assignments_by_creative:
+            assigned_packages = assignments_by_creative[result.creative_id]
+            if assigned_packages:
+                result.assigned_to = assigned_packages
+
+        if result.creative_id in assignment_errors_by_creative:
+            errors = assignment_errors_by_creative[result.creative_id]
+            if errors:
+                result.assignment_errors = errors
 
     # Create workflow steps for creatives requiring approval
     if creatives_needing_approval:
@@ -3075,8 +3378,10 @@ def _list_creatives_impl(
 
     start_time = time.time()
 
-    # Authentication (optional for discovery, like list_creative_formats)
-    principal_id = get_principal_from_context(context)  # Returns None if no auth
+    # Authentication - REQUIRED (creatives contain sensitive data)
+    # Unlike discovery endpoints (list_creative_formats), this returns actual creative assets
+    # which are principal-specific and must be access-controlled
+    principal_id = _get_principal_id_from_context(context)
 
     # Get tenant information
     tenant = get_current_tenant()
@@ -3091,8 +3396,8 @@ def _list_creatives_impl(
         from src.core.database.models import CreativeAssignment as DBAssignment
         from src.core.database.models import MediaBuy
 
-        # Build query
-        stmt = select(DBCreative).filter_by(tenant_id=tenant["tenant_id"])
+        # Build query - filter by tenant AND principal for security
+        stmt = select(DBCreative).filter_by(tenant_id=tenant["tenant_id"], principal_id=principal_id)
 
         # Apply filters
         if req.media_buy_id:
@@ -3616,12 +3921,25 @@ def _list_authorized_properties_impl(
         req = ListAuthorizedPropertiesRequest()
 
     # Get tenant and principal from context
-    tenant = get_current_tenant()
+    # Authentication is OPTIONAL for discovery endpoints (returns public inventory)
+    # require_valid_token=False means invalid tokens are treated like missing tokens (discovery endpoint behavior)
+    principal_id, tenant = get_principal_from_context(
+        context, require_valid_token=False
+    )  # May return (None, tenant) for public discovery
+
+    # Set tenant context if returned
+    if tenant:
+        set_current_tenant(tenant)
+    else:
+        tenant = get_current_tenant()
+
     if not tenant:
-        raise ToolError("AUTHENTICATION_ERROR", "Could not resolve tenant from context")
+        raise ToolError(
+            "TENANT_ERROR",
+            "Could not resolve tenant from request context (no subdomain, virtual host, or x-adcp-tenant header found)",
+        )
 
     tenant_id = tenant["tenant_id"]
-    principal_id = _get_principal_id_from_context(context)
 
     # Apply testing hooks
     from src.core.testing_hooks import TestingContext
@@ -3633,7 +3951,7 @@ def _list_authorized_properties_impl(
         headers = {}
     else:
         # FastMCP Context has meta.headers
-        headers = context.meta.get("headers", {}) if context and context.meta else {}
+        headers = context.meta.get("headers", {}) if context and hasattr(context, "meta") and context.meta else {}
         testing_context = get_testing_context(headers)
 
     # Note: apply_testing_hooks signature is (data, testing_ctx, operation, campaign_info)
@@ -3655,9 +3973,8 @@ def _list_authorized_properties_impl(
                     tag_filters.append(AuthorizedProperty.tags.contains([tag]))
                 stmt = stmt.where(sa.or_(*tag_filters))
 
-            # Only include verified properties
-            stmt = stmt.where(AuthorizedProperty.verification_status == "verified")
-
+            # Get all properties for this tenant (no verification status filter)
+            # Publishers control what properties they add - verification is informational only
             authorized_properties = session.scalars(stmt).all()
 
             # Convert database models to Pydantic models
@@ -3737,10 +4054,20 @@ def _list_authorized_properties_impl(
                         "Violations will result in campaign rejection or require manual review."
                     )
 
-            # Create response
+            # Extract unique publisher domains from properties
+            publisher_domains = sorted({prop.publisher_domain for prop in properties if prop.publisher_domain})
+
+            # If no properties configured, return error - NO FALLBACK BEHAVIOR
+            if not publisher_domains:
+                raise ToolError(
+                    "NO_PROPERTIES_CONFIGURED",
+                    f"No authorized properties configured for tenant '{tenant_id}'. "
+                    f"Please add properties via the Admin UI at /admin/tenant/{tenant_id}/authorized-properties",
+                )
+
+            # Create response with AdCP spec-compliant fields
             response = ListAuthorizedPropertiesResponse(
-                properties=properties,
-                tags=tag_metadata,
+                publisher_domains=publisher_domains,  # Required per AdCP v2.4 spec
                 advertising_policies=advertising_policies_text,
                 errors=[],
             )
@@ -3749,8 +4076,8 @@ def _list_authorized_properties_impl(
             audit_logger = get_audit_logger("AdCP", tenant_id)
             audit_logger.log_operation(
                 operation="list_authorized_properties",
-                principal_name=principal_id,
-                principal_id=principal_id,
+                principal_name=principal_id or "anonymous",
+                principal_id=principal_id or "anonymous",
                 adapter_id="mcp_server",
                 success=True,
                 details={
@@ -3795,7 +4122,66 @@ def list_authorized_properties(
     Returns:
         ListAuthorizedPropertiesResponse with properties and tag metadata
     """
-    return _list_authorized_properties_impl(req, context)
+    # FIX: Create MinimalContext with headers from FastMCP request (like A2A does)
+    # This ensures tenant detection works the same way for both MCP and A2A
+    import logging
+    import sys
+
+    logger = logging.getLogger(__name__)
+    tool_context = None
+
+    if context:
+        try:
+            print(f"[MCP DEBUG] context type={type(context)}", file=sys.stderr, flush=True)
+            print(f"[MCP DEBUG] has request_context={hasattr(context, 'request_context')}", file=sys.stderr, flush=True)
+            logger.info(f"MCP list_authorized_properties: context type={type(context)}")
+            logger.info(f"MCP list_authorized_properties: has request_context={hasattr(context, 'request_context')}")
+
+            # Access raw Starlette request headers via context.request_context.request
+            request = context.request_context.request
+            print(
+                f"[MCP DEBUG] request={request}, type={type(request) if request else None}", file=sys.stderr, flush=True
+            )
+            logger.info(f"MCP list_authorized_properties: request={request}, type={type(request) if request else None}")
+
+            if request and hasattr(request, "headers"):
+                headers = dict(request.headers)
+                print(f"[MCP DEBUG] Extracted {len(headers)} headers from request", file=sys.stderr, flush=True)
+                print(f"[MCP DEBUG] Host header={headers.get('host')}", file=sys.stderr, flush=True)
+                print(
+                    f"[MCP DEBUG] Apx-Incoming-Host header={headers.get('apx-incoming-host')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                logger.info(f"MCP list_authorized_properties: Extracted {len(headers)} headers from request")
+                logger.info(f"MCP list_authorized_properties: Host header={headers.get('host')}")
+
+                # Create MinimalContext matching A2A pattern
+                class MinimalContext:
+                    def __init__(self, headers):
+                        self.meta = {"headers": headers}
+                        self.headers = headers
+
+                tool_context = MinimalContext(headers)
+                print("[MCP DEBUG] Created MinimalContext successfully", file=sys.stderr, flush=True)
+                logger.info("MCP list_authorized_properties: Created MinimalContext successfully")
+            else:
+                print("[MCP DEBUG] request has no headers attribute", file=sys.stderr, flush=True)
+                logger.warning("MCP list_authorized_properties: request has no headers attribute")
+                tool_context = context
+        except Exception as e:
+            # Fallback to passing context as-is
+            print(f"[MCP DEBUG] Exception extracting headers: {e}", file=sys.stderr, flush=True)
+            logger.error(
+                f"MCP list_authorized_properties: Could not extract headers from FastMCP context: {e}", exc_info=True
+            )
+            tool_context = context
+    else:
+        print("[MCP DEBUG] No context provided", file=sys.stderr, flush=True)
+        logger.info("MCP list_authorized_properties: No context provided")
+        tool_context = context
+
+    return _list_authorized_properties_impl(req, tool_context)
 
 
 def _validate_pricing_model_selection(
@@ -3949,7 +4335,11 @@ async def _validate_and_convert_format_ids(
 
     # Get registered agents for this tenant
     registered_agents = registry._get_tenant_agents(tenant_id)
-    registered_agent_urls = {agent.agent_url for agent in registered_agents}
+    # Normalize agent URLs for consistent comparison (strips /mcp, /a2a, /.well-known/*, trailing slashes)
+    # This ensures all URL variations match: "https://example.com/mcp/" -> "https://example.com"
+    from src.core.validation import normalize_agent_url
+
+    registered_agent_urls = {normalize_agent_url(agent.agent_url) for agent in registered_agents}
 
     for idx, fmt_id in enumerate(format_ids):
         # STRICT ENFORCEMENT: Reject plain strings
@@ -3984,7 +4374,9 @@ async def _validate_and_convert_format_ids(
             )
 
         # VALIDATION: Check agent is registered
-        if agent_url not in registered_agent_urls:
+        # Normalize incoming agent_url for comparison (strips /mcp, /a2a, /.well-known/*, trailing slashes)
+        normalized_agent_url = normalize_agent_url(agent_url)
+        if normalized_agent_url not in registered_agent_urls:
             raise ToolError(
                 "FORMAT_VALIDATION_ERROR",
                 f"Package {package_idx + 1}, format_ids[{idx}]: Creative agent not registered: {agent_url}. "
@@ -4020,17 +4412,16 @@ async def _validate_and_convert_format_ids(
 
 async def _create_media_buy_impl(
     buyer_ref: str,
-    brand_manifest: Any | None = None,  # BrandManifest | str | None - validated by Pydantic
+    brand_manifest: Any,  # BrandManifest | str - REQUIRED per AdCP v2.2.0 spec
+    packages: list[Any],  # REQUIRED per AdCP spec
+    start_time: Any,  # datetime | Literal["asap"] | str - REQUIRED per AdCP spec
+    end_time: Any,  # datetime | str - REQUIRED per AdCP spec
+    budget: Any,  # Budget | float | dict - REQUIRED per AdCP spec
     po_number: str | None = None,
-    packages: list[Any] | None = None,
-    start_time: Any | None = None,  # datetime | Literal["asap"] | str - validated by Pydantic
-    end_time: Any | None = None,  # datetime | str - validated by Pydantic
-    budget: Any | None = None,  # Budget | float | dict - validated by Pydantic
-    promoted_offering: str | None = None,
-    product_ids: list[str] | None = None,
-    start_date: Any | None = None,  # date | str - validated by Pydantic
-    end_date: Any | None = None,  # date | str - validated by Pydantic
-    total_budget: float | None = None,
+    product_ids: list[str] | None = None,  # Legacy format conversion
+    start_date: Any | None = None,  # Legacy format conversion
+    end_date: Any | None = None,  # Legacy format conversion
+    total_budget: float | None = None,  # Legacy format conversion
     targeting_overlay: dict[str, Any] | None = None,
     pacing: str = "even",
     daily_budget: float | None = None,
@@ -4045,14 +4436,13 @@ async def _create_media_buy_impl(
     """Create a media buy with the specified parameters.
 
     Args:
-        buyer_ref: Buyer reference for tracking (required per AdCP spec)
-        brand_manifest: Brand information manifest - inline object or URL string (optional, auto-generated from promoted_offering if not provided)
+        buyer_ref: Buyer reference for tracking (REQUIRED per AdCP spec)
+        brand_manifest: Brand information manifest - inline object or URL string (REQUIRED per AdCP v2.2.0 spec)
+        packages: Array of packages with products and budgets (REQUIRED)
+        start_time: Campaign start time ISO 8601 or 'asap' (REQUIRED)
+        end_time: Campaign end time ISO 8601 (REQUIRED)
+        budget: Overall campaign budget (REQUIRED)
         po_number: Purchase order number (optional)
-        promoted_offering: DEPRECATED - use brand_manifest instead (still supported for backward compatibility)
-        packages: Array of packages with products and budgets
-        start_time: Campaign start time (ISO 8601)
-        end_time: Campaign end time (ISO 8601)
-        budget: Overall campaign budget
         product_ids: Legacy: Product IDs (converted to packages)
         start_date: Legacy: Start date (converted to start_time)
         end_date: Legacy: End date (converted to end_time)
@@ -4087,7 +4477,6 @@ async def _create_media_buy_impl(
             brand_manifest=brand_manifest,
             campaign_name=None,  # Optional display name
             po_number=po_number,
-            promoted_offering=promoted_offering,
             packages=packages,
             start_time=start_time,
             end_time=end_time,
@@ -4275,6 +4664,17 @@ async def _create_media_buy_impl(
                 if not package.product_id:
                     error_msg = f"Package {package.buyer_ref} must specify product_id."
                     raise ValueError(error_msg)
+
+            # Check for duplicate product_ids across packages
+            product_id_counts: dict[str, int] = {}
+            for package in req.packages:
+                if package.product_id:
+                    product_id_counts[package.product_id] = product_id_counts.get(package.product_id, 0) + 1
+
+            duplicate_products = [pid for pid, count in product_id_counts.items() if count > 1]
+            if duplicate_products:
+                error_msg = f"Duplicate product_id(s) found in packages: {', '.join(duplicate_products)}. Each product can only be used once per media buy."
+                raise ValueError(error_msg)
 
         # 4. Currency-specific budget validation
         from decimal import Decimal
@@ -5297,17 +5697,16 @@ async def _create_media_buy_impl(
 @mcp.tool()
 async def create_media_buy(
     buyer_ref: str,
-    brand_manifest: Any | None = None,  # BrandManifest | str | None - validated by Pydantic
+    brand_manifest: Any,  # BrandManifest | str - REQUIRED per AdCP v2.2.0 spec
+    packages: list[Any],  # REQUIRED per AdCP spec
+    start_time: Any,  # datetime | Literal["asap"] | str - REQUIRED per AdCP spec
+    end_time: Any,  # datetime | str - REQUIRED per AdCP spec
+    budget: Any,  # Budget | float | dict - REQUIRED per AdCP spec
     po_number: str | None = None,
-    packages: list[Any] | None = None,
-    start_time: Any | None = None,  # datetime | Literal["asap"] | str - validated by Pydantic
-    end_time: Any | None = None,  # datetime | str - validated by Pydantic
-    budget: Any | None = None,  # Budget | float | dict - validated by Pydantic
-    promoted_offering: str | None = None,
-    product_ids: list[str] | None = None,
-    start_date: Any | None = None,  # date | str - validated by Pydantic
-    end_date: Any | None = None,  # date | str - validated by Pydantic
-    total_budget: float | None = None,
+    product_ids: list[str] | None = None,  # Legacy format conversion
+    start_date: Any | None = None,  # Legacy format conversion
+    end_date: Any | None = None,  # Legacy format conversion
+    total_budget: float | None = None,  # Legacy format conversion
     targeting_overlay: dict[str, Any] | None = None,
     pacing: str = "even",
     daily_budget: float | None = None,
@@ -5325,14 +5724,13 @@ async def create_media_buy(
     MCP tool wrapper that delegates to the shared implementation.
 
     Args:
-        buyer_ref: Buyer reference for tracking (required per AdCP spec)
-        brand_manifest: Brand information manifest - inline object or URL string (optional, auto-generated from promoted_offering if not provided)
+        buyer_ref: Buyer reference for tracking (REQUIRED per AdCP spec)
+        brand_manifest: Brand information manifest - inline object or URL string (REQUIRED per AdCP v2.2.0 spec)
+        packages: Array of packages with products and budgets (REQUIRED)
+        start_time: Campaign start time ISO 8601 or 'asap' (REQUIRED)
+        end_time: Campaign end time ISO 8601 (REQUIRED)
+        budget: Overall campaign budget (REQUIRED)
         po_number: Purchase order number (optional)
-        promoted_offering: DEPRECATED - use brand_manifest instead (still supported for backward compatibility)
-        packages: Array of packages with products and budgets
-        start_time: Campaign start time (ISO 8601)
-        end_time: Campaign end time (ISO 8601)
-        budget: Overall campaign budget
         product_ids: Legacy: Product IDs (converted to packages)
         start_date: Legacy: Start date (converted to start_time)
         end_date: Legacy: End date (converted to end_time)
@@ -5355,7 +5753,6 @@ async def create_media_buy(
         buyer_ref=buyer_ref,
         brand_manifest=brand_manifest,
         po_number=po_number,
-        promoted_offering=promoted_offering,
         packages=packages,
         start_time=start_time,
         end_time=end_time,
@@ -5611,12 +6008,13 @@ def _update_media_buy_impl(
         action = "resume_media_buy" if req.active else "pause_media_buy"
         result = adapter.update_media_buy(
             media_buy_id=req.media_buy_id,
+            buyer_ref=req.buyer_ref or "",
             action=action,
             package_id=None,
             budget=None,
             today=datetime.combine(today, datetime.min.time()),
         )
-        if result.status == "failed":
+        if result.errors:
             return result
 
     # Handle package-level updates
@@ -5627,50 +6025,121 @@ def _update_media_buy_impl(
                 action = "resume_package" if pkg_update.active else "pause_package"
                 result = adapter.update_media_buy(
                     media_buy_id=req.media_buy_id,
+                    buyer_ref=req.buyer_ref or "",
                     action=action,
                     package_id=pkg_update.package_id,
                     budget=None,
                     today=datetime.combine(today, datetime.min.time()),
                 )
-                if result.status == "failed":
+                if result.errors:
+                    error_message = (
+                        result.errors[0].get("message", "Update failed") if result.errors else "Update failed"
+                    )
                     ctx_manager.update_workflow_step(
                         step.step_id,
                         status="failed",
-                        error_message=result.detail or "Update failed",
+                        error_message=error_message,
                     )
                     return result
 
             # Handle budget updates
-            if pkg_update.impressions is not None:
+            if pkg_update.budget is not None:
                 result = adapter.update_media_buy(
                     media_buy_id=req.media_buy_id,
-                    action="update_package_impressions",
-                    package_id=pkg_update.package_id,
-                    budget=pkg_update.impressions,
-                    today=datetime.combine(today, datetime.min.time()),
-                )
-                if result.status == "failed":
-                    ctx_manager.update_workflow_step(
-                        step.step_id,
-                        status="failed",
-                        error_message=result.detail or "Update failed",
-                    )
-                    return result
-            elif pkg_update.budget is not None:
-                result = adapter.update_media_buy(
-                    media_buy_id=req.media_buy_id,
+                    buyer_ref=req.buyer_ref or "",
                     action="update_package_budget",
                     package_id=pkg_update.package_id,
                     budget=int(pkg_update.budget),
                     today=datetime.combine(today, datetime.min.time()),
                 )
-                if result.status == "failed":
+                if result.errors:
+                    error_message = (
+                        result.errors[0].get("message", "Update failed") if result.errors else "Update failed"
+                    )
                     ctx_manager.update_workflow_step(
                         step.step_id,
                         status="failed",
-                        error_message=result.detail or "Update failed",
+                        error_message=error_message,
                     )
                     return result
+
+            # Handle creative_ids updates (AdCP v2.2.0+)
+            if pkg_update.creative_ids is not None:
+                from sqlalchemy import select
+
+                from src.core.database.database_session import get_db_session
+                from src.core.database.models import Creative as DBCreative
+                from src.core.database.models import CreativeAssignment as DBAssignment
+
+                with get_db_session() as session:
+                    # Validate all creative IDs exist
+                    creative_stmt = select(DBCreative).where(
+                        DBCreative.tenant_id == tenant["tenant_id"],
+                        DBCreative.creative_id.in_(pkg_update.creative_ids),
+                    )
+                    creatives_list = session.scalars(creative_stmt).all()
+                    found_creative_ids = {c.creative_id for c in creatives_list}
+                    missing_ids = set(pkg_update.creative_ids) - found_creative_ids
+
+                    if missing_ids:
+                        error_msg = f"Creative IDs not found: {', '.join(missing_ids)}"
+                        ctx_manager.update_workflow_step(step.step_id, status="failed", error_message=error_msg)
+                        return UpdateMediaBuyResponse(
+                            media_buy_id=req.media_buy_id or "",
+                            buyer_ref=req.buyer_ref or "",
+                            errors=[{"code": "creatives_not_found", "message": error_msg}],
+                        )
+
+                    # Get existing assignments for this package
+                    assignment_stmt = select(DBAssignment).where(
+                        DBAssignment.tenant_id == tenant["tenant_id"],
+                        DBAssignment.media_buy_id == req.media_buy_id,
+                        DBAssignment.package_id == pkg_update.package_id,
+                    )
+                    existing_assignments = session.scalars(assignment_stmt).all()
+                    existing_creative_ids = {a.creative_id for a in existing_assignments}
+
+                    # Determine added and removed creative IDs
+                    requested_ids = set(pkg_update.creative_ids)
+                    added_ids = requested_ids - existing_creative_ids
+                    removed_ids = existing_creative_ids - requested_ids
+
+                    # Remove old assignments
+                    for assignment in existing_assignments:
+                        if assignment.creative_id in removed_ids:
+                            session.delete(assignment)
+
+                    # Add new assignments
+                    import uuid
+
+                    for creative_id in added_ids:
+                        assignment_id = f"assign_{uuid.uuid4().hex[:12]}"
+                        assignment = DBAssignment(
+                            assignment_id=assignment_id,
+                            tenant_id=tenant["tenant_id"],
+                            media_buy_id=req.media_buy_id,
+                            package_id=pkg_update.package_id,
+                            creative_id=creative_id,
+                        )
+                        session.add(assignment)
+
+                    session.commit()
+
+                    # Store results for affected_packages response
+                    if not hasattr(req, "_affected_packages"):
+                        req._affected_packages = []
+                    req._affected_packages.append(
+                        {
+                            "buyer_package_ref": pkg_update.package_id,
+                            "changes_applied": {
+                                "creative_ids": {
+                                    "added": list(added_ids),
+                                    "removed": list(removed_ids),
+                                    "current": pkg_update.creative_ids,
+                                }
+                            },
+                        }
+                    )
 
     # Handle budget updates (Budget object from AdCP spec - v1.8.0 compatible)
     if req.budget is not None:
@@ -5740,9 +6209,13 @@ def _update_media_buy_impl(
         },
     )
 
+    # Build affected_packages from stored results
+    affected_packages = getattr(req, "_affected_packages", [])
+
     return UpdateMediaBuyResponse(
         media_buy_id=req.media_buy_id or "",
         buyer_ref=req.buyer_ref or "",
+        affected_packages=affected_packages if affected_packages else None,
     )
 
 
@@ -6103,7 +6576,9 @@ def get_media_buy_delivery(
 
 def _require_admin(context: Context) -> None:
     """Verify the request is from an admin user."""
-    principal_id = get_principal_from_context(context)
+    principal_id, tenant = get_principal_from_context(context)
+    if tenant:
+        set_current_tenant(tenant)
     if principal_id != "admin":
         raise PermissionError("This operation requires admin privileges")
 
@@ -6528,6 +7003,7 @@ def complete_task(req, context):
                         action = "resume_media_buy" if original_req.active else "pause_media_buy"
                         adapter.update_media_buy(
                             media_buy_id=original_req.media_buy_id,
+                            buyer_ref=original_req.buyer_ref or "",
                             action=action,
                             package_id=None,
                             budget=None,
@@ -6541,6 +7017,7 @@ def complete_task(req, context):
                                 action = "resume_package" if pkg_update.active else "pause_package"
                                 adapter.update_media_buy(
                                     media_buy_id=original_req.media_buy_id,
+                                    buyer_ref=original_req.buyer_ref or "",
                                     action=action,
                                     package_id=pkg_update.package_id,
                                     budget=None,
@@ -6636,8 +7113,11 @@ def verify_task(req, context):
 def mark_task_complete(req, context):
     """Mark a task as complete with automatic verification."""
     # Admin only
-    principal_id = get_principal_from_context(context)
-    tenant = get_current_tenant()
+    principal_id, tenant = get_principal_from_context(context)
+    if tenant:
+        set_current_tenant(tenant)
+    else:
+        tenant = get_current_tenant()
     if principal_id != f"{tenant['tenant_id']}_admin":
         raise ToolError("PERMISSION_DENIED", "Only administrators can mark tasks complete")
 
@@ -6824,8 +7304,11 @@ from src.core.strategy import StrategyManager
 
 def get_strategy_manager(context: Context | None) -> StrategyManager:
     """Get strategy manager for current context."""
-    principal_id = get_principal_from_context(context)
-    tenant_config = get_current_tenant()
+    principal_id, tenant_config = get_principal_from_context(context)
+    if tenant_config:
+        set_current_tenant(tenant_config)
+    else:
+        tenant_config = get_current_tenant()
 
     if not tenant_config:
         raise ToolError("No tenant configuration found")

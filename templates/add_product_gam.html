@@ -16,7 +16,7 @@
     </div>
     {% endif %}
 
-    <form id="product-form" method="POST">
+    <form id="product-form" method="POST" onsubmit="debugFormSubmission(event)">
         <!-- Section 1: Product Basics -->
         <h3 style="margin-top: 0; border-bottom: 2px solid #007bff; padding-bottom: 0.5rem;">Product Information</h3>
         <p style="color: #666; margin-bottom: 1.5rem;">Basic product details that buyers will see</p>
@@ -108,7 +108,7 @@
         <div id="formats-container" style="display: {% if product and product.formats %}grid{% else %}none{% endif %}; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1rem; margin-bottom: 1rem; max-height: 500px; overflow-y: auto; padding: 1rem; background: #f9f9f9; border: 1px solid #ddd; border-radius: 4px;">
             {% for format in formats %}
             <label class="format-card"
-                   data-format-id="{{ format.format_id }}"
+                   data-format-id="{{ format.id }}"
                    data-dimensions="{{ format.dimensions or '' }}"
                    data-type="{{ format.type }}"
                    data-description="{{ format.description or '' }}"
@@ -116,9 +116,9 @@
                    data-agent-url="{{ format.agent_url or '' }}"
                    data-search="{{ format.name|lower }} {{ format.type|lower }} {{ format.dimensions or '' }}"
                    style="border: 2px solid #ddd; border-radius: 4px; padding: 1rem; cursor: pointer; transition: all 0.2s; background: white; position: relative;">
-                <input type="checkbox" name="formats" value="{{ format.agent_url }}|{{ format.format_id }}" data-format-id="{{ format.format_id }}" data-agent-url="{{ format.agent_url }}" {% if selected_format_ids and (format.agent_url, format.format_id) in selected_format_ids %}checked{% endif %} style="margin-right: 0.5rem;">
+                <input type="checkbox" name="formats" value="{{ format.agent_url }}|{{ format.id }}" data-format-id="{{ format.id }}" data-agent-url="{{ format.agent_url }}" {% if selected_format_ids and (format.agent_url, format.id) in selected_format_ids %}checked{% endif %} style="margin-right: 0.5rem;">
                 <strong>{{ format.name }}</strong>
-                <span class="format-info-icon" onclick="event.preventDefault(); event.stopPropagation(); showFormatInfo('{{ format.name }}', '{{ format.description or 'No description available' }}', '{{ format.preview_url or '' }}', '{{ format.agent_url or '' }}', '{{ format.format_id }}');" style="cursor: help; color: #007bff; font-size: 0.9rem; margin-left: 0.3rem; float: right;">ⓘ</span>
+                <span class="format-info-icon" onclick="event.preventDefault(); event.stopPropagation(); showFormatInfo({{ format.name | tojson }}, {{ (format.description or 'No description available') | tojson }}, {{ (format.preview_url or '') | tojson }}, {{ (format.agent_url or '') | tojson }}, {{ format.id | tojson }});" style="cursor: help; color: #007bff; font-size: 0.9rem; margin-left: 0.3rem; float: right;">ⓘ</span>
                 <br>
                 <small style="color: #666;">
                     {{ format.type }}
@@ -474,7 +474,6 @@ async function autoSuggestFormats(selectedCheckboxes) {
                 // This format fits - show it
                 matchingCount++;
                 card.style.display = 'block';
-                checkbox.disabled = false;
 
                 // Auto-check if not already checked
                 if (!checkbox.checked) {
@@ -489,16 +488,19 @@ async function autoSuggestFormats(selectedCheckboxes) {
                     }, 2000);
                 }
             } else {
-                // This format doesn't fit - hide it completely
+                // This format doesn't fit - hide it but preserve checked state
+                // User might have selected it deliberately, so don't uncheck it
+                // IMPORTANT: Don't disable checkbox - disabled inputs don't submit with form!
                 card.style.display = 'none';
-                checkbox.disabled = true;
-                checkbox.checked = false;
+                // checkbox.disabled = true; // REMOVED - would prevent form submission
+                // DO NOT uncheck: checkbox.checked = false;
             }
         } else {
-            // No dimensions - hide it
+            // No dimensions - hide it but preserve checked state
+            // IMPORTANT: Don't disable checkbox - disabled inputs don't submit with form!
             card.style.display = 'none';
-            checkbox.disabled = true;
-            checkbox.checked = false;
+            // checkbox.disabled = true; // REMOVED - would prevent form submission
+            // DO NOT uncheck: checkbox.checked = false;
         }
     });
 
@@ -711,6 +713,22 @@ function removePricingOption(index) {
     if (element) {
         element.remove();
     }
+}
+
+// Debug form submission
+function debugFormSubmission(event) {
+    const formatCheckboxes = document.querySelectorAll('input[name="formats"]:checked');
+    const formatValues = Array.from(formatCheckboxes).map(cb => cb.value);
+    console.log('[DEBUG] Form submission - checked formats:', formatValues);
+    console.log('[DEBUG] Form submission - total checked:', formatValues.length);
+
+    if (formatValues.length === 0) {
+        console.error('[DEBUG] NO FORMATS CHECKED ON SUBMIT!');
+        // Don't prevent submission, just log the issue
+    }
+
+    // Continue with form submission
+    return true;
 }
 
 // Filter formats based on search input

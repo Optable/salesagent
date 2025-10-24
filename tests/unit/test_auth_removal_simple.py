@@ -19,8 +19,9 @@ class TestAuthRemovalChanges:
         context.meta = {}  # Empty meta, no headers
 
         with patch("src.core.main.get_http_headers", return_value={}):  # No x-adcp-auth header
-            result = get_principal_from_context(context)
-            assert result is None
+            principal_id, tenant = get_principal_from_context(context)
+            assert principal_id is None
+            assert tenant is None
 
     def test_get_principal_from_context_works_with_auth(self):
         """Test that get_principal_from_context still works with auth."""
@@ -28,12 +29,39 @@ class TestAuthRemovalChanges:
         from src.core.main import get_principal_from_context
 
         context = Mock(spec=["meta"])  # Limit to only meta attribute
-        context.meta = {"headers": {"x-adcp-auth": "test-token"}}
+        # Must include Host header for tenant detection (security fix)
+        context.meta = {
+            "headers": {
+                "x-adcp-auth": "test-token",
+                "host": "test-tenant.sales-agent.scope3.com",  # Required for tenant detection
+            }
+        }
 
-        with patch("src.core.main.get_http_headers", return_value={"x-adcp-auth": "test-token"}):
-            with patch("src.core.main.get_principal_from_token", return_value="test_principal"):
-                result = get_principal_from_context(context)
-                assert result == "test_principal"
+        with patch(
+            "src.core.main.get_http_headers",
+            return_value={
+                "x-adcp-auth": "test-token",
+                "host": "test-tenant.sales-agent.scope3.com",
+            },
+        ):
+            # Mock virtual host lookup to fail (not a virtual host)
+            with patch("src.core.main.get_tenant_by_virtual_host", return_value=None):
+                # Mock subdomain lookup to succeed
+                with patch("src.core.main.get_tenant_by_subdomain") as mock_tenant_lookup:
+                    mock_tenant_lookup.return_value = {
+                        "tenant_id": "tenant_test",
+                        "subdomain": "test-tenant",
+                        "name": "Test Tenant",
+                    }
+                    with patch("src.core.main.set_current_tenant"):
+                        with patch("src.core.main.get_principal_from_token", return_value="test_principal"):
+                            principal_id, tenant = get_principal_from_context(context)
+                            assert principal_id == "test_principal"
+                            assert tenant == {
+                                "tenant_id": "tenant_test",
+                                "subdomain": "test-tenant",
+                                "name": "Test Tenant",
+                            }
 
     def test_audit_logging_handles_none_principal(self):
         """Test that audit logging works with None principal_id."""
@@ -55,8 +83,13 @@ class TestAuthRemovalChanges:
         with open("src/core/main.py") as f:
             source = f.read()
 
-        # Key changes should be present
-        assert "get_principal_from_context(context)  # Returns None if no auth" in source
+        # Key changes should be present - tuple return after ContextVar fix
+        # Updated to accept new require_valid_token parameter for discovery endpoints
+        assert (
+            "get_principal_from_context(context)  # Returns (None, None) if no auth" in source
+            or "get_principal_from_context(context)  # Returns None if no auth" in source
+            or "require_valid_token=False" in source  # New pattern for discovery endpoints
+        )
         assert 'principal_id or "anonymous"' in source
 
     def test_pricing_filtering_for_anonymous_users(self):

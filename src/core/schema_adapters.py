@@ -22,16 +22,10 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 from src.core.schemas import AdCPBaseModel, FormatId
+
+# Import generated schema (now a single class after schema regeneration on Oct 17, 2025)
 from src.core.schemas_generated._schemas_v1_media_buy_get_products_request_json import (
     GetProductsRequest as _GeneratedGetProductsRequest,
-)
-
-# Import generated schemas
-from src.core.schemas_generated._schemas_v1_media_buy_get_products_request_json import (
-    GetProductsRequest1 as _GeneratedGetProductsRequest1,
-)
-from src.core.schemas_generated._schemas_v1_media_buy_get_products_request_json import (
-    GetProductsRequest2 as _GeneratedGetProductsRequest2,
 )
 
 
@@ -43,10 +37,10 @@ class GetProductsRequest(BaseModel):
     but complex to use. This adapter hides that complexity.
 
     Usage:
-        # Simple construction (just like manual schemas)
-        req = GetProductsRequest(promoted_offering="https://example.com", brief="Video ads")
+        # Simple construction with brand_manifest
+        req = GetProductsRequest(brand_manifest={"name": "Nike Shoes"}, brief="Video ads")
 
-        # With brand_manifest
+        # With full brand manifest
         req = GetProductsRequest(
             brand_manifest={"name": "Acme", "url": "https://acme.com"},
             brief="Display ads"
@@ -92,9 +86,6 @@ class GetProductsRequest(BaseModel):
     def to_generated(self) -> _GeneratedGetProductsRequest:
         """Convert to the generated schema for protocol validation.
 
-        This creates the appropriate generated schema variant (GetProductsRequest1 or
-        GetProductsRequest2) based on which fields are present.
-
         Returns:
             Generated schema instance that can be validated against AdCP JSON Schema
         """
@@ -115,29 +106,13 @@ class GetProductsRequest(BaseModel):
                     for fmt_id in filters_dict["format_ids"]
                 ]
 
-        # Determine which variant to use
-        variant: _GeneratedGetProductsRequest1 | _GeneratedGetProductsRequest2
-        if self.promoted_offering and not self.brand_manifest:
-            # Use variant 1 (requires promoted_offering)
-            variant = _GeneratedGetProductsRequest1(
-                promoted_offering=self.promoted_offering,
-                brief=self.brief or None,
-                filters=filters_dict,  # type: ignore[arg-type]
-            )
-        elif self.brand_manifest:
-            # Use variant 2 (requires brand_manifest)
-            variant = _GeneratedGetProductsRequest2(
-                promoted_offering=self.promoted_offering,
-                brand_manifest=self.brand_manifest,  # type: ignore[arg-type]
-                brief=self.brief or None,
-                filters=filters_dict,  # type: ignore[arg-type]
-            )
-        else:
-            # Fallback - shouldn't happen due to validator
-            raise ValueError("Either promoted_offering or brand_manifest must be provided")
-
-        # Wrap in RootModel
-        return _GeneratedGetProductsRequest(root=variant)  # type: ignore[arg-type]
+        # Create generated schema instance (only fields that exist in AdCP spec)
+        # Note: promoted_offering, min_exposures, strategy_id, webhook_url are adapter-only fields
+        return _GeneratedGetProductsRequest(
+            brand_manifest=self.brand_manifest,  # type: ignore[arg-type]
+            brief=self.brief or None,
+            filters=filters_dict,  # type: ignore[arg-type]
+        )
 
     @classmethod
     def from_generated(cls, generated: _GeneratedGetProductsRequest) -> "GetProductsRequest":
@@ -149,8 +124,8 @@ class GetProductsRequest(BaseModel):
         Returns:
             Adapter instance with simple API
         """
-        # Extract data from the RootModel union
-        data = generated.root.model_dump()
+        # Extract data from generated schema (now a flat class after schema regeneration)
+        data = generated.model_dump()
 
         return cls(**data)
 
@@ -451,9 +426,10 @@ class ListAuthorizedPropertiesResponse(AdCPBaseModel):
 
     model_config = {"arbitrary_types_allowed": True}
 
-    # Fields from generated schema (flexible - accepts dicts or objects)
-    properties: list[Any] = Field(..., description="Array of authorized properties")
-    tags: dict[str, Any] = Field(default_factory=dict, description="Metadata for tags")
+    # Fields from AdCP spec v2.4
+    publisher_domains: list[str] = Field(
+        ..., description="Publisher domains this agent is authorized to represent", min_length=1
+    )
     primary_channels: list[str] | None = Field(None, description="Primary advertising channels")
     primary_countries: list[str] | None = Field(None, description="Primary countries (ISO 3166-1 alpha-2)")
     portfolio_description: str | None = Field(None, description="Markdown portfolio description", max_length=5000)
@@ -467,6 +443,7 @@ class ListAuthorizedPropertiesResponse(AdCPBaseModel):
         min_length=1,
         max_length=10000,
     )
+    last_updated: str | None = Field(None, description="ISO 8601 timestamp of when authorization list was last updated")
     errors: list[Any] | None = Field(None, description="Task-specific errors and warnings")
 
     def __str__(self) -> str:
@@ -475,13 +452,13 @@ class ListAuthorizedPropertiesResponse(AdCPBaseModel):
         Used by both MCP (for display) and A2A (for task messages).
         Provides conversational text without adding non-spec fields to the schema.
         """
-        count = len(self.properties)
+        count = len(self.publisher_domains)
         if count == 0:
-            return "No authorized properties found."
+            return "No authorized publisher domains found."
         elif count == 1:
-            return "Found 1 authorized property."
+            return f"Found 1 authorized publisher domain: {self.publisher_domains[0]}"
         else:
-            return f"Found {count} authorized properties."
+            return f"Found {count} authorized publisher domains."
 
     def to_generated(self) -> _GeneratedListAuthorizedPropertiesResponse:
         """Convert to generated schema for protocol validation."""

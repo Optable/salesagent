@@ -575,25 +575,72 @@ function testGAMConnection() {
     });
 }
 
-// Sync GAM inventory
-function syncGAMInventory() {
-    console.log('=== syncGAMInventory START ===');
+// Check for in-progress sync on page load
+function checkForInProgressSync() {
+    // Only check if we're on a page with the sync button
     const button = document.querySelector('button[onclick="syncGAMInventory()"]');
-    console.log('Button:', button);
-    console.log('Button disabled?', button ? button.disabled : 'NO BUTTON FOUND');
-    const originalText = button.innerHTML;
-    console.log('Original text:', originalText);
+    if (!button) return;
 
-    button.disabled = true;
+    // Check if there's a running sync
+    const checkUrl = `${config.scriptName}/tenant/${config.tenantId}/gam/sync-status/latest`;
+
+    fetch(checkUrl)
+        .then(response => {
+            if (response.ok) {
+                return response.json();
+            }
+            // If no in-progress sync, that's fine - button stays as "Sync Now"
+            return null;
+        })
+        .then(data => {
+            if (data && data.status === 'running') {
+                // Resume polling the existing sync
+                const originalText = button.innerHTML;
+                button.disabled = true;
+
+                // Start loading animation
+                let dots = '';
+                button.innerHTML = '⏳ Syncing';
+                const loadingInterval = setInterval(() => {
+                    dots = dots.length >= 3 ? '' : dots + '.';
+                    button.innerHTML = `⏳ Syncing${dots}`;
+                }, 300);
+
+                // Start polling the existing sync
+                pollSyncStatus(data.sync_id, button, originalText, loadingInterval);
+            }
+        })
+        .catch(error => {
+            // Silently fail - user can manually start sync
+            console.log('Could not check for in-progress sync:', error);
+        });
+}
+
+// Sync GAM inventory (with background polling)
+function syncGAMInventory(mode = 'full') {
+    // Find the button that was clicked
+    const button = mode === 'incremental'
+        ? document.querySelector('button[onclick*="incremental"]')
+        : document.querySelector('button[onclick*="full"]');
+
+    if (!button) {
+        alert('❌ Could not find sync button');
+        return;
+    }
+
+    const originalText = button.innerHTML;
+
+    // Disable both buttons during sync
+    const allButtons = document.querySelectorAll('button[onclick*="syncGAMInventory"]');
+    allButtons.forEach(btn => btn.disabled = true);
 
     // Simple animated dots loading indicator
     let dots = '';
-    button.innerHTML = '⏳ Syncing';
-    console.log('Set button to:', button.innerHTML);
+    const syncLabel = mode === 'incremental' ? 'Syncing (Incremental)' : 'Syncing (Full Reset)';
+    button.innerHTML = `⏳ ${syncLabel}`;
     const loadingInterval = setInterval(() => {
         dots = dots.length >= 3 ? '' : dots + '.';
-        button.innerHTML = `⏳ Syncing${dots}`;
-        console.log('Button text now:', button.innerHTML);
+        button.innerHTML = `⏳ ${syncLabel}${dots}`;
     }, 300);
 
     const url = `${config.scriptName}/tenant/${config.tenantId}/gam/sync-inventory`;
@@ -602,54 +649,190 @@ function syncGAMInventory() {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-        }
+        },
+        body: JSON.stringify({ mode: mode })
     })
     .then(response => {
-        return response.json();
+        // Handle both success and 409 (conflict) responses
+        if (response.ok || response.status === 409) {
+            return response.json();
+        }
+        throw new Error(`Server error: ${response.status}`);
     })
     .then(data => {
-        clearInterval(loadingInterval);
-        button.disabled = false;
-        button.innerHTML = originalText;
-
-        if (data.success) {
-            // Extract actual counts from response (not dict keys!)
-            const adUnitCount = (data.ad_units || {}).total || 0;
-            const placementCount = (data.placements || {}).total || 0;
-            const labelCount = (data.labels || {}).total || 0;
-            const targetingKeyCount = (data.custom_targeting || {}).total_keys || 0;
-            const targetingValueCount = (data.custom_targeting || {}).total_values || 0;
-            const audienceCount = (data.audience_segments || {}).total || 0;
-
-            const totalCount = adUnitCount + placementCount + labelCount + targetingKeyCount + targetingValueCount + audienceCount;
-
-            let message = `✅ Inventory synced successfully!\n\n`;
-            if (adUnitCount > 0) message += `• ${adUnitCount} ad units\n`;
-            if (placementCount > 0) message += `• ${placementCount} placements\n`;
-            if (labelCount > 0) message += `• ${labelCount} labels\n`;
-            if (targetingKeyCount > 0) {
-                message += `• ${targetingKeyCount} custom targeting keys`;
-                if (targetingValueCount > 0) message += ` (${targetingValueCount} values)`;
-                message += `\n`;
-            }
-            if (audienceCount > 0) message += `• ${audienceCount} audience segments\n`;
-
-            if (totalCount === 0) {
-                message = '✅ Inventory synced successfully!\n\nNo inventory items found in GAM.';
-            }
-
-            alert(message);
-            location.reload();
+        if (data.success && data.sync_id) {
+            // Sync started in background - poll for status
+            pollSyncStatus(data.sync_id, button, originalText, loadingInterval);
+        } else if (data.in_progress) {
+            // Already syncing - poll existing job
+            pollSyncStatus(data.sync_id, button, originalText, loadingInterval);
         } else {
+            // Immediate error
+            clearInterval(loadingInterval);
+
+            // Re-enable both buttons
+            const allButtons = document.querySelectorAll('button[onclick*="syncGAMInventory"]');
+            allButtons.forEach(btn => btn.disabled = false);
+
+            button.innerHTML = originalText;
             alert('❌ Sync failed: ' + (data.error || data.message || 'Unknown error'));
         }
     })
     .catch(error => {
         clearInterval(loadingInterval);
-        button.disabled = false;
+
+        // Re-enable both buttons
+        const allButtons = document.querySelectorAll('button[onclick*="syncGAMInventory"]');
+        allButtons.forEach(btn => btn.disabled = false);
+
         button.innerHTML = originalText;
         alert('❌ Error: ' + error.message);
     });
+}
+
+// Poll sync status until completion
+function pollSyncStatus(syncId, button, originalText, loadingInterval) {
+    const statusUrl = `${config.scriptName}/tenant/${config.tenantId}/gam/sync-status/${syncId}`;
+
+    // Show "navigate away" message
+    const syncMessage = document.createElement('div');
+    syncMessage.id = 'sync-progress-message';
+    syncMessage.className = 'alert alert-info mt-2';
+    syncMessage.innerHTML = '<strong>💡 Tip:</strong> Feel free to navigate away - the sync continues in the background!';
+    button.parentElement.appendChild(syncMessage);
+
+    const checkStatus = () => {
+        fetch(statusUrl)
+            .then(response => response.json())
+            .then(data => {
+                // Update button text with progress
+                if (data.progress) {
+                    clearInterval(loadingInterval);
+                    const progress = data.progress;
+                    const phaseText = progress.phase || 'Syncing';
+                    const count = progress.count || 0;
+                    const phaseNum = progress.phase_num || 0;
+                    const totalPhases = progress.total_phases || 6;
+
+                    if (count > 0) {
+                        button.innerHTML = `⏳ ${phaseText}: ${count} items (${phaseNum}/${totalPhases})`;
+                    } else {
+                        button.innerHTML = `⏳ ${phaseText} (${phaseNum}/${totalPhases})`;
+                    }
+                }
+
+                if (data.status === 'completed') {
+                    clearInterval(loadingInterval);
+
+                    // Re-enable both sync buttons
+                    const allButtons = document.querySelectorAll('button[onclick*="syncGAMInventory"]');
+                    allButtons.forEach(btn => btn.disabled = false);
+
+                    // Reset the button that was clicked
+                    button.innerHTML = originalText;
+
+                    // Remove progress message
+                    const msg = document.getElementById('sync-progress-message');
+                    if (msg) msg.remove();
+
+                    // Show success message with summary
+                    const summary = data.summary || {};
+                    const adUnitCount = (summary.ad_units || {}).total || 0;
+                    const placementCount = (summary.placements || {}).total || 0;
+                    const labelCount = (summary.labels || {}).total || 0;
+                    const targetingKeyCount = (summary.custom_targeting || {}).total_keys || 0;
+                    const audienceCount = (summary.audience_segments || {}).total || 0;
+
+                    let message = `✅ Inventory synced successfully!\n\n`;
+                    if (adUnitCount > 0) message += `• ${adUnitCount} ad units\n`;
+                    if (placementCount > 0) message += `• ${placementCount} placements\n`;
+                    if (labelCount > 0) message += `• ${labelCount} labels\n`;
+                    if (targetingKeyCount > 0) message += `• ${targetingKeyCount} custom targeting keys\n`;
+                    if (audienceCount > 0) message += `• ${audienceCount} audience segments\n`;
+
+                    alert(message);
+                    location.reload();
+                } else if (data.status === 'failed') {
+                    clearInterval(loadingInterval);
+                    button.disabled = false;
+                    button.innerHTML = originalText;
+
+                    // Remove progress message
+                    const msg = document.getElementById('sync-progress-message');
+                    if (msg) msg.remove();
+
+                    alert('❌ Sync failed: ' + (data.error || 'Unknown error'));
+                } else if (data.status === 'running' || data.status === 'pending') {
+                    // Still running - continue polling
+                    setTimeout(checkStatus, 2000); // Poll every 2 seconds
+                } else {
+                    // Unknown status
+                    clearInterval(loadingInterval);
+                    button.disabled = false;
+                    button.innerHTML = originalText;
+
+                    // Remove progress message
+                    const msg = document.getElementById('sync-progress-message');
+                    if (msg) msg.remove();
+
+                    alert('❌ Unknown sync status: ' + data.status);
+                }
+            })
+            .catch(error => {
+                clearInterval(loadingInterval);
+                button.disabled = false;
+                button.innerHTML = originalText;
+
+                // Remove progress message
+                const msg = document.getElementById('sync-progress-message');
+                if (msg) msg.remove();
+
+                alert('❌ Error checking sync status: ' + error.message);
+            });
+    };
+
+    // Start polling after 1 second
+    setTimeout(checkStatus, 1000);
+}
+
+// Reset a stuck sync job
+function resetStuckSync() {
+    if (!confirm('⚠️ This will mark the current sync as failed and allow you to start a new one.\n\nAre you sure you want to reset the stuck sync?')) {
+        return;
+    }
+
+    const button = document.querySelector('button[onclick*="resetStuckSync"]');
+    if (button) {
+        button.disabled = true;
+        button.innerHTML = '⏳ Resetting...';
+    }
+
+    fetch(`${config.scriptName}/tenant/${config.tenantId}/gam/reset-stuck-sync`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        }
+    })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                alert('✅ ' + data.message);
+                location.reload();
+            } else {
+                alert('❌ Failed to reset sync: ' + (data.error || data.message || 'Unknown error'));
+                if (button) {
+                    button.disabled = false;
+                    button.innerHTML = '🛑 Reset Stuck Sync';
+                }
+            }
+        })
+        .catch(error => {
+            alert('❌ Error resetting sync: ' + error.message);
+            if (button) {
+                button.disabled = false;
+                button.innerHTML = '🛑 Reset Stuck Sync';
+            }
+        });
 }
 
 // Check OAuth token status
@@ -763,9 +946,6 @@ function testSignalsEndpoint() {
 }
 
 // Debug log for adapter detection
-console.log('Backend says active_adapter is:', config.activeAdapter);
-console.log('Backend says tenant.ad_server is:', document.querySelector('[data-tenant-ad-server]')?.dataset.tenantAdServer);
-
 // Update principal
 function updatePrincipal(principalId) {
     const name = document.getElementById(`principal_name_${principalId}`).value;
@@ -923,6 +1103,9 @@ document.addEventListener('DOMContentLoaded', function() {
         // Add event listener for checkbox toggle
         document.getElementById('policy_check_enabled').addEventListener('change', updateAdvertisingPolicyUI);
     }
+
+    // Check for in-progress sync on page load
+    checkForInProgressSync();
 });
 
 // Adapter selection functions (called from template onclick handlers)
@@ -1204,6 +1387,131 @@ function savePrincipalMappings() {
         }
     })
     .catch(error => {
+        alert('Error: ' + error.message);
+    });
+}
+
+// Service Account Management Functions
+function createServiceAccount() {
+    const button = document.getElementById('create-service-account-btn');
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Creating...';
+
+    fetch(`${config.scriptName}/tenant/${config.tenantId}/gam/create-service-account`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        }
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert('Service account created successfully!\n\nEmail: ' + data.service_account_email + '\n\n' + data.message);
+            // Reload page to show the service account email and next steps
+            location.reload();
+        } else {
+            alert('Error creating service account: ' + (data.error || 'Unknown error'));
+            button.disabled = false;
+            button.innerHTML = '🔑 Create Service Account';
+        }
+    })
+    .catch(error => {
+        alert('Error: ' + error.message);
+        button.disabled = false;
+        button.innerHTML = '🔑 Create Service Account';
+    });
+}
+
+function copyServiceAccountEmail() {
+    const emailElement = document.querySelector('code');
+    if (emailElement) {
+        const email = emailElement.textContent;
+        navigator.clipboard.writeText(email).then(() => {
+            const button = event.target;
+            const originalText = button.textContent;
+            button.textContent = '✓ Copied!';
+            button.classList.add('btn-success');
+            button.classList.remove('btn-secondary');
+            setTimeout(() => {
+                button.textContent = originalText;
+                button.classList.remove('btn-success');
+                button.classList.add('btn-secondary');
+            }, 2000);
+        });
+    }
+}
+
+function saveServiceAccountNetworkCode() {
+    const button = event.target;
+    const networkCodeInput = document.getElementById('service_account_network_code');
+    const networkCode = networkCodeInput.value.trim();
+
+    if (!networkCode) {
+        alert('Please enter a network code');
+        return;
+    }
+
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Saving...';
+
+    // Save network code via the GAM configure endpoint
+    fetch(`${config.scriptName}/tenant/${config.tenantId}/gam/configure`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            auth_method: 'service_account',
+            network_code: networkCode
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        button.disabled = false;
+        button.innerHTML = 'Save Network Code';
+
+        if (data.success) {
+            alert('✅ Network code saved successfully!\n\nYou can now test the connection.');
+            // Reload page to show updated state
+            location.reload();
+        } else {
+            alert('❌ Failed to save network code:\n\n' + (data.error || data.errors?.join('\n') || 'Unknown error'));
+        }
+    })
+    .catch(error => {
+        button.disabled = false;
+        button.innerHTML = 'Save Network Code';
+        alert('Error: ' + error.message);
+    });
+}
+
+function testGAMServiceAccountConnection() {
+    const button = event.target;
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Testing...';
+
+    // Use existing GAM test connection endpoint
+    // The backend will automatically use service account if configured
+    fetch(`${config.scriptName}/tenant/${config.tenantId}/gam/test-connection`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        }
+    })
+    .then(response => response.json())
+    .then(data => {
+        button.disabled = false;
+        button.innerHTML = 'Test Connection';
+
+        if (data.success) {
+            alert('✅ Connection successful!\n\nNetwork: ' + (data.networks?.[0]?.displayName || 'N/A') + '\nNetwork Code: ' + (data.networks?.[0]?.networkCode || 'N/A'));
+        } else {
+            alert('❌ Connection failed!\n\n' + (data.error || 'Unknown error') + '\n\nPlease make sure:\n1. You added the service account email to your GAM\n2. You assigned the Trafficker role\n3. You clicked Save in GAM\n4. You saved the correct network code');
+        }
+    })
+    .catch(error => {
+        button.disabled = false;
+        button.innerHTML = 'Test Connection';
         alert('Error: ' + error.message);
     });
 }

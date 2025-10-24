@@ -74,11 +74,11 @@ def validate_gam_config(data: dict) -> list | None:
             errors.append("Refresh token is too long")
     elif auth_method == "service_account":
         # Service account JSON validation
+        # Note: service_account_json is only required on initial setup
+        # For network code updates, it's optional (already stored in DB)
         service_account_json = data.get("service_account_json", "").strip()
-        if not service_account_json:
-            errors.append("Service account JSON is required for service account authentication")
-        else:
-            # Validate JSON structure
+        if service_account_json:
+            # Validate JSON structure only if provided
             try:
                 import json
 
@@ -113,7 +113,11 @@ def detect_gam_network(tenant_id):
         return jsonify({"success": False, "error": "Access denied"}), 403
 
     try:
-        data = request.get_json()
+        # Use force=True and silent=True to handle empty/malformed requests gracefully
+        data = request.get_json(force=True, silent=True)
+        if data is None:
+            return jsonify({"success": False, "error": "Invalid or empty request body"}), 400
+
         refresh_token = data.get("refresh_token")
         network_code_provided = data.get("network_code")  # For multi-network selection
 
@@ -295,7 +299,26 @@ def configure_gam(tenant_id):
         return jsonify({"success": False, "error": "Access denied"}), 403
 
     try:
-        data = request.get_json()
+        # Try to get JSON - use force=True to handle potential Content-Type issues
+        data = request.get_json(force=True, silent=True)
+
+        # Handle None data (request parsing failed)
+        if data is None:
+            logger.error(
+                f"Failed to parse JSON from request for tenant {tenant_id}. "
+                f"Content-Type: {request.content_type}, "
+                f"Data length: {len(request.data) if request.data else 0}, "
+                f"Data preview: {request.data[:200] if request.data else 'empty'}"
+            )
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Invalid JSON in request body. Please ensure you're sending valid JSON.",
+                    }
+                ),
+                400,
+            )
 
         # Validate GAM configuration data
         validation_errors = validate_gam_config(data)
@@ -350,7 +373,9 @@ def configure_gam(tenant_id):
                 adapter_config.gam_refresh_token = refresh_token
                 adapter_config.gam_service_account_json = None
             elif auth_method == "service_account":
-                adapter_config.gam_service_account_json = service_account_json
+                # Only update service_account_json if provided (to allow network code updates without resending JSON)
+                if service_account_json:
+                    adapter_config.gam_service_account_json = service_account_json
                 adapter_config.gam_refresh_token = None
 
             # Also update tenant's ad_server field
@@ -535,18 +560,34 @@ def get_gam_custom_targeting_keys(tenant_id):
 @log_admin_action("sync_gam_inventory")
 @require_tenant_access()
 def sync_gam_inventory(tenant_id):
-    """Trigger GAM inventory sync for a tenant."""
+    """Trigger GAM inventory sync for a tenant (background job).
+
+    Request body:
+        mode: "full" (default) or "incremental"
+          - full: Complete reset - deletes all inventory and re-syncs everything
+          - incremental: Only fetches items modified since last successful sync
+    """
     if session.get("role") == "viewer":
         return jsonify({"success": False, "error": "Access denied"}), 403
 
     try:
+        # Get sync mode from request body (default to "incremental" - safer since it doesn't delete data)
+        # Use force=True and silent=True to handle empty/malformed requests gracefully
+        request_data = request.get_json(force=True, silent=True) or {}
+        sync_mode = request_data.get("mode", "incremental")
+
+        logger.info(f"Inventory sync request - tenant: {tenant_id}, mode: {sync_mode}, request_data: {request_data}")
+
+        if sync_mode not in ["full", "incremental"]:
+            return jsonify({"success": False, "error": "Invalid sync mode. Must be 'full' or 'incremental'"}), 400
+
         with get_db_session() as db_session:
             # Get tenant and adapter config
             tenant = db_session.scalars(select(Tenant).filter_by(tenant_id=tenant_id)).first()
             if not tenant:
                 return jsonify({"success": False, "error": "Tenant not found"}), 404
 
-            from src.core.database.models import AdapterConfig
+            from src.core.database.models import AdapterConfig, SyncJob
 
             adapter_config = db_session.scalars(select(AdapterConfig).filter_by(tenant_id=tenant_id)).first()
 
@@ -561,53 +602,731 @@ def sync_gam_inventory(tenant_id):
                     400,
                 )
 
-            # Create OAuth2 client
-            from googleads import oauth2
+            # Check for existing running sync
+            existing_sync = db_session.scalars(
+                select(SyncJob).where(
+                    SyncJob.tenant_id == tenant_id, SyncJob.status == "running", SyncJob.sync_type == "inventory"
+                )
+            ).first()
 
-            oauth2_client = oauth2.GoogleRefreshTokenClient(
-                client_id=os.environ.get("GAM_OAUTH_CLIENT_ID"),
-                client_secret=os.environ.get("GAM_OAUTH_CLIENT_SECRET"),
-                refresh_token=adapter_config.gam_refresh_token,
+            if existing_sync:
+                # Check if sync is stale (running for >1 hour with no progress updates)
+                from datetime import timedelta
+
+                # Make started_at timezone-aware if it's naive (from database)
+                started_at = existing_sync.started_at
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=UTC)
+
+                time_running = datetime.now(UTC) - started_at
+                is_stale = time_running > timedelta(hours=1) and not existing_sync.progress
+
+                if is_stale:
+                    # Mark stale sync as failed and allow new sync to start
+                    existing_sync.status = "failed"
+                    existing_sync.completed_at = datetime.now(UTC)
+                    existing_sync.error_message = (
+                        "Sync thread died (stale after 1+ hour with no progress) - marked as failed to allow fresh sync"
+                    )
+                    db_session.commit()
+                    logger.warning(
+                        f"Marked stale sync {existing_sync.sync_id} as failed (running since {existing_sync.started_at}, no progress)"
+                    )
+                else:
+                    # Sync is actually running, return 409
+                    return (
+                        jsonify(
+                            {
+                                "success": False,
+                                "in_progress": True,
+                                "sync_id": existing_sync.sync_id,
+                                "message": "Sync already in progress",
+                            }
+                        ),
+                        409,
+                    )
+
+            # Extract config values before starting background thread (avoid session issues)
+            gam_network_code = adapter_config.gam_network_code
+            gam_refresh_token = adapter_config.gam_refresh_token
+
+            # Get last successful sync time for incremental mode
+            last_sync_time = None
+            if sync_mode == "incremental":
+                last_successful_sync = db_session.scalars(
+                    select(SyncJob)
+                    .where(
+                        SyncJob.tenant_id == tenant_id,
+                        SyncJob.sync_type == "inventory",
+                        SyncJob.status == "completed",
+                    )
+                    .order_by(SyncJob.completed_at.desc())
+                ).first()
+
+                if last_successful_sync and last_successful_sync.completed_at:
+                    last_sync_time = last_successful_sync.completed_at
+                    logger.info(f"Incremental sync: using last successful sync time: {last_sync_time}")
+                else:
+                    logger.warning(
+                        "Incremental sync requested but no previous successful sync found - falling back to full sync"
+                    )
+                    sync_mode = "full"
+                    last_sync_time = None  # Reset since we're doing full sync
+
+            # Create sync job
+            sync_id = f"sync_{tenant_id}_{int(datetime.now(UTC).timestamp())}"
+            sync_job = SyncJob(
+                sync_id=sync_id,
+                tenant_id=tenant_id,
+                adapter_type="google_ad_manager",
+                sync_type="inventory",
+                status="pending",
+                started_at=datetime.now(UTC),
+                triggered_by="admin_ui",
+                triggered_by_id=session.get("user_email", "unknown"),
             )
-
-            # Create GAM client
-            client = ad_manager.AdManagerClient(
-                oauth2_client, "AdCP Sales Agent", network_code=adapter_config.gam_network_code
-            )
-
-            # Initialize GAM inventory discovery
-            discovery = GAMInventoryDiscovery(client=client, tenant_id=tenant_id)
-
-            # Perform full inventory sync
-            result = discovery.sync_all()
-
-            # Save to database
-            from src.services.gam_inventory_service import GAMInventoryService
-
-            inventory_service = GAMInventoryService(db_session)
-            inventory_service._save_inventory_to_db(tenant_id, discovery)
-
-            # Update tenant's last sync time
-            tenant.last_inventory_sync = datetime.now(UTC)
+            db_session.add(sync_job)
             db_session.commit()
 
-            logger.info(f"Successfully synced GAM inventory for tenant {tenant_id}")
+            # Start background sync (using threading for now - can upgrade to Celery later)
+            import threading
+
+            def run_sync():
+                try:
+                    with get_db_session() as bg_session:
+                        # Update status to running
+                        bg_sync_job = bg_session.scalars(select(SyncJob).filter_by(sync_id=sync_id)).first()
+                        bg_sync_job.status = "running"
+                        bg_session.commit()
+
+                        # Create OAuth2 client
+                        from googleads import oauth2
+
+                        oauth2_client = oauth2.GoogleRefreshTokenClient(
+                            client_id=os.environ.get("GAM_OAUTH_CLIENT_ID"),
+                            client_secret=os.environ.get("GAM_OAUTH_CLIENT_SECRET"),
+                            refresh_token=gam_refresh_token,
+                        )
+
+                        # Create GAM client
+                        client = ad_manager.AdManagerClient(
+                            oauth2_client, "AdCP Sales Agent", network_code=gam_network_code
+                        )
+
+                        # Initialize GAM inventory discovery
+                        discovery = GAMInventoryDiscovery(client=client, tenant_id=tenant_id)
+
+                        # Helper function to update progress
+                        def update_progress(phase: str, phase_num: int, total_phases: int, count: int = 0):
+                            bg_sync_job.progress = {
+                                "phase": phase,
+                                "phase_num": phase_num,
+                                "total_phases": total_phases,
+                                "count": count,
+                            }
+                            bg_session.commit()
+
+                        # Perform inventory sync with progress tracking
+                        # Note: sync_mode and last_sync_time are captured from outer scope
+                        total_phases = 7 if sync_mode == "full" else 6  # Add delete phase for full reset
+                        from datetime import datetime as dt
+
+                        start_time = dt.now()
+
+                        # Phase 0: Full reset - delete all existing inventory (only for full sync)
+                        if sync_mode == "full":
+                            update_progress("Deleting Existing Inventory", 1, total_phases)
+                            from sqlalchemy import delete
+
+                            from src.core.database.models import GAMInventory
+
+                            stmt = delete(GAMInventory).where(GAMInventory.tenant_id == tenant_id)
+                            bg_session.execute(stmt)
+                            bg_session.commit()
+                            logger.info(f"Full reset: deleted all existing inventory for tenant {tenant_id}")
+
+                        # Adjust phase numbers if we did full reset
+                        phase_offset = 1 if sync_mode == "full" else 0
+
+                        # Initialize inventory service for streaming writes
+                        from src.services.gam_inventory_service import GAMInventoryService
+
+                        inventory_service = GAMInventoryService(bg_session)
+                        sync_time = dt.now()
+
+                        # Phase 1: Ad Units (fetch → write → clear memory)
+                        update_progress("Discovering Ad Units", 1 + phase_offset, total_phases)
+                        ad_units = discovery.discover_ad_units(since=last_sync_time)
+                        update_progress("Writing Ad Units to DB", 1 + phase_offset, total_phases, len(ad_units))
+                        inventory_service._write_inventory_batch(tenant_id, "ad_unit", ad_units, sync_time)
+                        ad_units_count = len(ad_units)
+                        discovery.ad_units.clear()  # Clear from memory
+                        logger.info(f"Wrote {ad_units_count} ad units to database")
+
+                        # Phase 2: Placements (fetch → write → clear memory)
+                        update_progress("Discovering Placements", 2 + phase_offset, total_phases)
+                        placements = discovery.discover_placements(since=last_sync_time)
+                        update_progress("Writing Placements to DB", 2 + phase_offset, total_phases, len(placements))
+                        inventory_service._write_inventory_batch(tenant_id, "placement", placements, sync_time)
+                        placements_count = len(placements)
+                        discovery.placements.clear()  # Clear from memory
+                        logger.info(f"Wrote {placements_count} placements to database")
+
+                        # Phase 3: Labels (fetch → write → clear memory)
+                        update_progress("Discovering Labels", 3 + phase_offset, total_phases)
+                        labels = discovery.discover_labels(since=last_sync_time)
+                        update_progress("Writing Labels to DB", 3 + phase_offset, total_phases, len(labels))
+                        inventory_service._write_inventory_batch(tenant_id, "label", labels, sync_time)
+                        labels_count = len(labels)
+                        discovery.labels.clear()  # Clear from memory
+                        logger.info(f"Wrote {labels_count} labels to database")
+
+                        # Phase 4: Custom Targeting Keys (fetch → write → clear memory)
+                        update_progress("Discovering Targeting Keys", 4 + phase_offset, total_phases)
+                        custom_targeting = discovery.discover_custom_targeting(fetch_values=False, since=last_sync_time)
+                        update_progress(
+                            "Writing Targeting Keys to DB",
+                            4 + phase_offset,
+                            total_phases,
+                            custom_targeting.get("total_keys", 0),
+                        )
+                        inventory_service._write_custom_targeting_keys(
+                            tenant_id, list(discovery.custom_targeting_keys.values()), sync_time
+                        )
+                        targeting_count = len(discovery.custom_targeting_keys)
+                        discovery.custom_targeting_keys.clear()  # Clear from memory
+                        discovery.custom_targeting_values.clear()  # Clear from memory
+                        logger.info(f"Wrote {targeting_count} targeting keys to database")
+
+                        # Phase 5: Audience Segments (fetch → write → clear memory)
+                        update_progress("Discovering Audience Segments", 5 + phase_offset, total_phases)
+                        audience_segments = discovery.discover_audience_segments(since=last_sync_time)
+                        update_progress(
+                            "Writing Audience Segments to DB", 5 + phase_offset, total_phases, len(audience_segments)
+                        )
+                        inventory_service._write_inventory_batch(
+                            tenant_id, "audience_segment", audience_segments, sync_time
+                        )
+                        segments_count = len(audience_segments)
+                        discovery.audience_segments.clear()  # Clear from memory
+                        logger.info(f"Wrote {segments_count} audience segments to database")
+
+                        # Phase 6: Mark stale inventory
+                        update_progress("Marking Stale Inventory", 6 + phase_offset, total_phases)
+                        inventory_service._mark_stale_inventory(tenant_id, sync_time)
+
+                        # Build result summary
+                        end_time = dt.now()
+                        result = {
+                            "tenant_id": tenant_id,
+                            "sync_time": end_time.isoformat(),
+                            "duration_seconds": (end_time - start_time).total_seconds(),
+                            "ad_units": {"total": ad_units_count},
+                            "placements": {"total": placements_count},
+                            "labels": {"total": labels_count},
+                            "custom_targeting": {
+                                "total_keys": targeting_count,
+                                "note": "Values lazy loaded on demand",
+                            },
+                            "audience_segments": {"total": segments_count},
+                            "streaming": True,
+                            "memory_optimized": True,
+                        }
+
+                        # Update sync job with success
+                        bg_sync_job.status = "completed"
+                        bg_sync_job.completed_at = datetime.now(UTC)
+                        bg_sync_job.summary = json.dumps(result)
+                        bg_session.commit()
+
+                        logger.info(f"Successfully synced GAM inventory for tenant {tenant_id}")
+
+                except Exception as e:
+                    logger.error(f"Error syncing GAM inventory for tenant {tenant_id}: {e}", exc_info=True)
+                    try:
+                        with get_db_session() as err_session:
+                            err_sync_job = err_session.scalars(select(SyncJob).filter_by(sync_id=sync_id)).first()
+                            if err_sync_job:
+                                err_sync_job.status = "failed"
+                                err_sync_job.completed_at = datetime.now(UTC)
+                                err_sync_job.error_message = str(e)
+                                err_session.commit()
+                    except:
+                        pass  # Ignore errors in error handling
+
+            # Start background thread
+            sync_thread = threading.Thread(target=run_sync, daemon=True)
+            sync_thread.start()
 
             return jsonify(
                 {
                     "success": True,
-                    "message": "Inventory synced successfully",
-                    "ad_units": result.get("ad_units", {}),
-                    "placements": result.get("placements", {}),
-                    "labels": result.get("labels", {}),
-                    "custom_targeting": result.get("custom_targeting", {}),
-                    "audience_segments": result.get("audience_segments", {}),
+                    "sync_id": sync_id,
+                    "message": "Inventory sync started in background",
+                    "status": "pending",
                 }
             )
 
     except Exception as e:
-        logger.error(f"Error syncing GAM inventory for tenant {tenant_id}: {e}", exc_info=True)
+        logger.error(f"Error starting GAM inventory sync for tenant {tenant_id}: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@gam_bp.route("/sync-status/<sync_id>", methods=["GET"])
+@require_tenant_access()
+def get_sync_status(tenant_id, sync_id):
+    """Get status of a sync job."""
+    try:
+        with get_db_session() as db_session:
+            from src.core.database.models import SyncJob
+
+            sync_job = db_session.scalars(select(SyncJob).filter_by(sync_id=sync_id, tenant_id=tenant_id)).first()
+
+            if not sync_job:
+                return jsonify({"error": "Sync job not found"}), 404
+
+            response = {
+                "sync_id": sync_job.sync_id,
+                "status": sync_job.status,
+                "started_at": sync_job.started_at.isoformat() if sync_job.started_at else None,
+                "completed_at": sync_job.completed_at.isoformat() if sync_job.completed_at else None,
+            }
+
+            # Include real-time progress if available
+            if sync_job.progress:
+                response["progress"] = sync_job.progress
+
+            if sync_job.summary:
+                try:
+                    response["summary"] = json.loads(sync_job.summary)
+                except:
+                    response["summary"] = sync_job.summary
+
+            if sync_job.error_message:
+                response["error"] = sync_job.error_message
+
+            return jsonify(response)
+
+    except Exception as e:
+        logger.error(f"Error getting sync status: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@gam_bp.route("/sync-status/latest", methods=["GET"])
+@require_tenant_access()
+def get_latest_sync_status(tenant_id):
+    """Get the latest running sync job for a tenant."""
+    try:
+        with get_db_session() as db_session:
+            from src.core.database.models import SyncJob
+
+            # Find the most recent running sync
+            sync_job = db_session.scalars(
+                select(SyncJob)
+                .where(SyncJob.tenant_id == tenant_id, SyncJob.status == "running", SyncJob.sync_type == "inventory")
+                .order_by(SyncJob.started_at.desc())
+            ).first()
+
+            if not sync_job:
+                return jsonify({"message": "No running sync found"}), 404
+
+            response = {
+                "sync_id": sync_job.sync_id,
+                "status": sync_job.status,
+                "started_at": sync_job.started_at.isoformat() if sync_job.started_at else None,
+            }
+
+            # Include real-time progress if available
+            if sync_job.progress:
+                response["progress"] = sync_job.progress
+
+            return jsonify(response)
+
+    except Exception as e:
+        logger.error(f"Error getting latest sync status: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@gam_bp.route("/reset-stuck-sync", methods=["POST"])
+@log_admin_action("reset_stuck_gam_sync")
+@require_tenant_access()
+def reset_stuck_sync(tenant_id):
+    """Reset a stuck inventory sync job.
+
+    Marks any running inventory sync as failed and allows a new sync to start.
+    Use this when a sync appears to be hanging or frozen.
+    """
+    if session.get("role") == "viewer":
+        return jsonify({"success": False, "error": "Access denied"}), 403
+
+    try:
+        with get_db_session() as db_session:
+            from src.core.database.models import SyncJob
+
+            # Find running inventory sync
+            running_sync = db_session.scalars(
+                select(SyncJob).where(
+                    SyncJob.tenant_id == tenant_id, SyncJob.status == "running", SyncJob.sync_type == "inventory"
+                )
+            ).first()
+
+            if not running_sync:
+                return jsonify({"success": False, "message": "No running sync found to reset"}), 404
+
+            # Mark as failed
+            running_sync.status = "failed"
+            running_sync.completed_at = datetime.now(UTC)
+            running_sync.error_message = "Manually reset by admin (sync appeared to be stuck)"
+
+            db_session.commit()
+
+            logger.info(
+                f"Admin reset stuck sync {running_sync.sync_id} for tenant {tenant_id} "
+                f"(started at {running_sync.started_at})"
+            )
+
+            return jsonify(
+                {
+                    "success": True,
+                    "message": "Stuck sync has been reset. You can now start a new sync.",
+                    "reset_sync_id": running_sync.sync_id,
+                }
+            )
+
+    except Exception as e:
+        logger.error(f"Error resetting stuck sync: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@gam_bp.route("/create-service-account", methods=["POST"])
+@log_admin_action("create_gam_service_account")
+@require_tenant_access()
+def create_service_account(tenant_id):
+    """Create a GCP service account for GAM integration.
+
+    This creates a service account in our GCP project, generates credentials,
+    and stores them encrypted in the database. The partner then configures
+    this service account email in their GAM.
+    """
+    if session.get("role") == "viewer":
+        return jsonify({"success": False, "error": "Access denied"}), 403
+
+    try:
+        # Get GCP project ID from environment or configuration
+        gcp_project_id = os.environ.get("GCP_PROJECT_ID")
+        if not gcp_project_id:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "GCP_PROJECT_ID not configured. Please set this environment variable.",
+                    }
+                ),
+                500,
+            )
+
+        from src.services.gcp_service_account_service import GCPServiceAccountService
+
+        service = GCPServiceAccountService(gcp_project_id=gcp_project_id)
+
+        # Create service account for tenant
+        try:
+            service_account_email, _ = service.create_service_account_for_tenant(tenant_id=tenant_id)
+
+            return jsonify(
+                {
+                    "success": True,
+                    "service_account_email": service_account_email,
+                    "message": "Service account created successfully. Please add this email as a user in your Google Ad Manager with Trafficker role.",
+                }
+            )
+
+        except ValueError as e:
+            # Tenant not found or already has service account
+            return jsonify({"success": False, "error": str(e)}), 400
+
+        except Exception as e:
+            logger.error(f"Error creating service account for tenant {tenant_id}: {e}", exc_info=True)
+            return jsonify({"success": False, "error": f"Failed to create service account: {str(e)}"}), 500
+
+    except Exception as e:
+        logger.error(f"Error in create_service_account endpoint: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@gam_bp.route("/get-service-account-email", methods=["GET"])
+@require_tenant_access(api_mode=True)
+def get_service_account_email(tenant_id):
+    """Get the service account email for a tenant.
+
+    Returns the service account email if one has been created for this tenant.
+    """
+    try:
+        gcp_project_id = os.environ.get("GCP_PROJECT_ID")
+        if not gcp_project_id:
+            return jsonify({"error": "GCP_PROJECT_ID not configured"}), 500
+
+        from src.services.gcp_service_account_service import GCPServiceAccountService
+
+        service = GCPServiceAccountService(gcp_project_id=gcp_project_id)
+        email = service.get_service_account_email(tenant_id)
+
+        if email:
+            return jsonify({"success": True, "service_account_email": email})
+        else:
+            return jsonify({"success": True, "service_account_email": None, "message": "No service account created"})
+
+    except Exception as e:
+        logger.error(f"Error getting service account email: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@gam_bp.route("/test-connection", methods=["POST"])
+@log_admin_action("test_gam_connection")
+@require_tenant_access()
+def test_gam_connection(tenant_id):
+    """Test GAM connection with refresh token or service account and fetch available resources.
+
+    Request body:
+        refresh_token: Optional refresh token (for OAuth authentication)
+        auth_method: Optional "oauth" or "service_account" (default: infer from request body)
+
+    If no refresh_token is provided, tries to use service account credentials from tenant's adapter config.
+    """
+    if session.get("role") == "viewer":
+        return jsonify({"success": False, "error": "Access denied"}), 403
+
+    try:
+        # Use force=True and silent=True to handle empty/malformed requests gracefully
+        data = request.get_json(force=True, silent=True) or {}
+        refresh_token = data.get("refresh_token")
+        auth_method = data.get("auth_method")
+
+        # If no explicit auth_method, infer from what's provided
+        if not auth_method:
+            if refresh_token:
+                auth_method = "oauth"
+            else:
+                auth_method = "service_account"
+
+        # Get OAuth credentials from environment variables
+        client_id = os.environ.get("GAM_OAUTH_CLIENT_ID")
+        client_secret = os.environ.get("GAM_OAUTH_CLIENT_SECRET")
+
+        oauth2_client = None
+
+        if auth_method == "oauth":
+            # OAuth flow with refresh token
+            if not refresh_token:
+                return jsonify({"error": "Refresh token is required for OAuth authentication"}), 400
+
+            if not client_id or not client_secret:
+                return (
+                    jsonify(
+                        {
+                            "error": "GAM OAuth credentials not configured. Please set GAM_OAUTH_CLIENT_ID and GAM_OAUTH_CLIENT_SECRET environment variables."
+                        }
+                    ),
+                    400,
+                )
+
+            # Test by creating credentials and making a simple API call
+            from googleads import oauth2
+
+            # Create GoogleAds OAuth2 client with refresh token
+            oauth2_client = oauth2.GoogleRefreshTokenClient(
+                client_id=client_id,
+                client_secret=client_secret,
+                refresh_token=refresh_token,
+            )
+
+            # Test if credentials are valid by trying to refresh
+            try:
+                oauth2_client.Refresh()
+            except Exception as e:
+                return jsonify({"error": f"Invalid refresh token: {str(e)}"}), 400
+
+        elif auth_method == "service_account":
+            # Service account flow
+            with get_db_session() as db_session:
+                from src.core.database.models import AdapterConfig
+
+                adapter_config = db_session.scalars(select(AdapterConfig).filter_by(tenant_id=tenant_id)).first()
+
+                if not adapter_config or not adapter_config.gam_service_account_json:
+                    return (
+                        jsonify(
+                            {
+                                "error": "No service account configured for this tenant. Please configure service account credentials first."
+                            }
+                        ),
+                        400,
+                    )
+
+                # Check if network code is configured (required for service account)
+                network_code = adapter_config.gam_network_code
+                if not network_code:
+                    return (
+                        jsonify(
+                            {
+                                "error": "Network code is required for service account authentication. Please configure the GAM network code first."
+                            }
+                        ),
+                        400,
+                    )
+
+                # Parse service account JSON
+                try:
+                    import json as json_lib
+
+                    service_account_info = json_lib.loads(adapter_config.gam_service_account_json)
+                except json_lib.JSONDecodeError as e:
+                    return jsonify({"error": f"Invalid service account JSON: {str(e)}"}), 400
+
+                # Create credentials from service account (in-memory, no temp file needed)
+                from google.oauth2 import service_account
+
+                credentials = service_account.Credentials.from_service_account_info(
+                    service_account_info,
+                    scopes=["https://www.googleapis.com/auth/dfp"],
+                )
+                # Wrap in GoogleCredentialsClient for AdManagerClient compatibility
+                oauth2_client = oauth2.GoogleCredentialsClient(credentials)
+
+        else:
+            return jsonify({"error": f"Invalid auth_method: {auth_method}"}), 400
+
+        # Initialize GAM client to get network info
+        # Note: For service account auth, network_code is required and retrieved from adapter_config
+        # For OAuth, we can call getAllNetworks without a network_code
+        if auth_method == "service_account":
+            client = ad_manager.AdManagerClient(oauth2_client, "AdCP-Sales-Agent-Setup", network_code=network_code)
+        else:
+            client = ad_manager.AdManagerClient(oauth2_client, "AdCP-Sales-Agent-Setup")
+
+        # Get network service
+        network_service = client.GetService("NetworkService", version=GAM_API_VERSION)
+
+        # Get all networks user has access to
+        networks = []
+        try:
+            # Service account auth with network_code already set - use getCurrentNetwork
+            if auth_method == "service_account":
+                logger.info("Using service account auth - calling getCurrentNetwork()")
+                current_network = network_service.getCurrentNetwork()
+                logger.info(f"getCurrentNetwork() returned: {current_network}")
+                networks = [
+                    {
+                        "id": current_network["id"],
+                        "displayName": current_network["displayName"],
+                        "networkCode": current_network["networkCode"],
+                    }
+                ]
+            else:
+                # OAuth - try getAllNetworks first
+                logger.info("Using OAuth - attempting to call getAllNetworks()")
+                all_networks = network_service.getAllNetworks()
+                logger.info(f"getAllNetworks() returned: {all_networks}")
+                if all_networks:
+                    logger.info(f"Processing {len(all_networks)} networks")
+                    for network in all_networks:
+                        logger.info(f"Network data: {network}")
+                        networks.append(
+                            {
+                                "id": network["id"],
+                                "displayName": network["displayName"],
+                                "networkCode": network["networkCode"],
+                            }
+                        )
+                else:
+                    logger.info("getAllNetworks() returned empty/None")
+        except AttributeError as e:
+            # getAllNetworks might not be available, fall back to getCurrentNetwork
+            logger.info(f"getAllNetworks not available (AttributeError: {e}), falling back to getCurrentNetwork")
+            try:
+                current_network = network_service.getCurrentNetwork()
+                logger.info(f"getCurrentNetwork() returned: {current_network}")
+                networks = [
+                    {
+                        "id": current_network["id"],
+                        "displayName": current_network["displayName"],
+                        "networkCode": current_network["networkCode"],
+                    }
+                ]
+            except Exception as e:
+                logger.error(f"Failed to get network info: {e}")
+                networks = []
+        except Exception as e:
+            logger.error(f"Failed to get networks: {e}")
+            logger.exception("Full exception details:")
+            networks = []
+
+        result = {
+            "success": True,
+            "message": "Successfully connected to Google Ad Manager",
+            "networks": networks,
+        }
+
+        # If we got a network, fetch companies and users
+        if networks:
+            try:
+                # Reinitialize client with network code for subsequent calls
+                network_code = networks[0]["networkCode"]
+                logger.info(f"Reinitializing client with network code: {network_code}")
+
+                client = ad_manager.AdManagerClient(oauth2_client, "AdCP-Sales-Agent-Setup", network_code=network_code)
+
+                # Get company service for advertisers
+                company_service = client.GetService("CompanyService", version=GAM_API_VERSION)
+
+                # Build a statement to get advertisers
+                from googleads import ad_manager as gam_utils
+
+                statement_builder = gam_utils.StatementBuilder()
+                statement_builder.Where("type = :type")
+                statement_builder.WithBindVariable("type", "ADVERTISER")
+                statement_builder.Limit(100)
+
+                # Get companies
+                logger.info("Calling getCompaniesByStatement for ADVERTISER companies")
+                response = company_service.getCompaniesByStatement(statement_builder.ToStatement())
+                logger.info(f"getCompaniesByStatement response: {response}")
+
+                companies = []
+                if response and hasattr(response, "results"):
+                    logger.info(f"Found {len(response.results)} companies")
+                    for company in response.results:
+                        logger.info(f"Company: id={company.id}, name={company.name}, type={company.type}")
+                        companies.append(
+                            {
+                                "id": company.id,
+                                "name": company.name,
+                                "type": company.type,
+                            }
+                        )
+                else:
+                    logger.info("No companies found in response")
+
+                result["companies"] = companies
+
+                # Get current user info
+                user_service = client.GetService("UserService", version=GAM_API_VERSION)
+                current_user = user_service.getCurrentUser()
+                result["current_user"] = {
+                    "id": current_user.id,
+                    "name": current_user.name,
+                    "email": current_user.email,
+                }
+
+            except Exception as e:
+                # It's okay if we can't fetch companies/users
+                result["warning"] = f"Connected but couldn't fetch all resources: {str(e)}"
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error testing GAM connection: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @gam_bp.route("/api/line-item/<line_item_id>", methods=["GET"])

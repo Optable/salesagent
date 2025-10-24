@@ -1042,3 +1042,199 @@ def update_business_rules(tenant_id):
 
         flash(f"Error updating business rules: {str(e)}", "error")
         return redirect(url_for("tenants.tenant_settings", tenant_id=tenant_id, section="business-rules"))
+
+
+@settings_bp.route("/approximated-domain-status", methods=["POST"])
+@require_tenant_access()
+def check_approximated_domain_status(tenant_id):
+    """Check if a domain is registered with Approximated."""
+    try:
+        import requests
+
+        data = request.get_json()
+        domain = data.get("domain")
+        if not domain:
+            return jsonify({"success": False, "error": "Domain required"}), 400
+
+        approximated_api_key = os.getenv("APPROXIMATED_API_KEY")
+        if not approximated_api_key:
+            return jsonify({"success": False, "error": "Approximated not configured"}), 500
+
+        # Check domain registration status using correct Approximated API endpoint
+        response = requests.get(
+            f"https://cloud.approximated.app/api/vhosts/by/incoming/{domain}",
+            headers={
+                "api-key": approximated_api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+
+        if response.status_code == 200:
+            response_data = response.json()
+            # Approximated API wraps data in 'data' key
+            domain_data = response_data.get("data", response_data)
+
+            return jsonify(
+                {
+                    "success": True,
+                    "registered": True,
+                    "status": domain_data.get("status"),
+                    "tls_enabled": domain_data.get("has_ssl", False),
+                    "ssl_active": domain_data.get("status", "").startswith("ACTIVE_SSL"),
+                    "target_address": domain_data.get("target_address"),
+                }
+            )
+        elif response.status_code == 404:
+            return jsonify({"success": True, "registered": False})
+        else:
+            logger.error(f"Approximated API error: {response.status_code} - {response.text}")
+            return jsonify({"success": False, "error": f"API error: {response.status_code}"}), 500
+
+    except Exception as e:
+        logger.error(f"Error checking domain status: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@settings_bp.route("/approximated-register-domain", methods=["POST"])
+@require_tenant_access()
+@log_admin_action("register_approximated_domain")
+def register_approximated_domain(tenant_id):
+    """Register a domain with Approximated for TLS and routing."""
+    try:
+        import requests
+
+        data = request.get_json()
+        domain = data.get("domain")
+        if not domain:
+            return jsonify({"success": False, "error": "Domain required"}), 400
+
+        approximated_api_key = os.getenv("APPROXIMATED_API_KEY")
+        if not approximated_api_key:
+            return jsonify({"success": False, "error": "Approximated not configured"}), 500
+
+        with get_db_session() as db_session:
+            tenant = db_session.scalars(select(Tenant).filter_by(tenant_id=tenant_id)).first()
+            if not tenant:
+                return jsonify({"success": False, "error": "Tenant not found"}), 404
+
+            if tenant.virtual_host != domain:
+                return jsonify({"success": False, "error": "Domain must match tenant's virtual_host"}), 400
+
+        # Get backend target address from environment
+        backend_url = os.getenv("APPROXIMATED_BACKEND_URL", "adcp-sales-agent.fly.dev")
+
+        # Register domain with Approximated using correct API endpoint
+        response = requests.post(
+            "https://cloud.approximated.app/api/vhosts",
+            headers={
+                "api-key": approximated_api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json={
+                "incoming_address": domain,
+                "target_address": backend_url,
+            },
+            timeout=10,
+        )
+
+        if response.status_code in (200, 201):
+            logger.info(f"✅ Registered domain with Approximated: {domain}")
+            return jsonify({"success": True, "message": f"Domain {domain} registered successfully"})
+        elif response.status_code == 409:
+            # Already exists - that's OK
+            logger.info(f"✅ Domain already registered: {domain}")
+            return jsonify({"success": True, "message": f"Domain {domain} already registered"})
+        else:
+            error_msg = f"Approximated API error: {response.status_code} - {response.text}"
+            logger.error(error_msg)
+            return jsonify({"success": False, "error": error_msg}), response.status_code
+
+    except Exception as e:
+        logger.error(f"Error registering domain: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@settings_bp.route("/approximated-unregister-domain", methods=["POST"])
+@require_tenant_access()
+@log_admin_action("unregister_approximated_domain")
+def unregister_approximated_domain(tenant_id):
+    """Unregister a domain from Approximated."""
+    try:
+        import requests
+
+        data = request.get_json()
+        domain = data.get("domain")
+        if not domain:
+            return jsonify({"success": False, "error": "Domain required"}), 400
+
+        approximated_api_key = os.getenv("APPROXIMATED_API_KEY")
+        if not approximated_api_key:
+            return jsonify({"success": False, "error": "Approximated not configured"}), 500
+
+        # Unregister domain from Approximated using correct API endpoint
+        response = requests.delete(
+            f"https://cloud.approximated.app/api/vhosts/by/incoming/{domain}",
+            headers={
+                "api-key": approximated_api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+
+        if response.status_code in (200, 204):
+            logger.info(f"✅ Unregistered domain from Approximated: {domain}")
+            return jsonify({"success": True, "message": f"Domain {domain} unregistered successfully"})
+        elif response.status_code == 404:
+            # Already gone - that's OK
+            logger.info(f"✅ Domain already unregistered: {domain}")
+            return jsonify({"success": True, "message": f"Domain {domain} was not registered"})
+        else:
+            error_msg = f"Approximated API error: {response.status_code} - {response.text}"
+            logger.error(error_msg)
+            return jsonify({"success": False, "error": error_msg}), response.status_code
+
+    except Exception as e:
+        logger.error(f"Error unregistering domain: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@settings_bp.route("/approximated-token", methods=["POST"])
+@require_tenant_access()
+def get_approximated_token(tenant_id):
+    """Generate an Approximated DNS widget token."""
+    try:
+        import requests
+
+        # Get API key from environment
+        approximated_api_key = os.getenv("APPROXIMATED_API_KEY")
+        if not approximated_api_key:
+            logger.error("APPROXIMATED_API_KEY not configured in environment")
+            return jsonify({"success": False, "error": "DNS widget not configured on server"}), 500
+
+        with get_db_session() as db_session:
+            tenant = db_session.scalars(select(Tenant).filter_by(tenant_id=tenant_id)).first()
+            if not tenant:
+                return jsonify({"success": False, "error": "Tenant not found"}), 404
+
+            # Request token from Approximated API
+            response = requests.get(
+                "https://cloud.approximated.app/api/dns/token",
+                headers={"api-key": approximated_api_key},
+                timeout=10,
+            )
+
+            if response.status_code == 200:
+                token_data = response.json()
+                logger.info(f"Approximated API response: {token_data}")
+                return jsonify({"success": True, "token": token_data.get("token")})
+            else:
+                logger.error(f"Approximated API error: {response.status_code} - {response.text}")
+                return jsonify({"success": False, "error": f"API error: {response.status_code}"}), response.status_code
+
+    except Exception as e:
+        logger.error(f"Error generating Approximated token: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
