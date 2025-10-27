@@ -72,7 +72,7 @@ class DynamicPricingService:
                 )
 
             except Exception as e:
-                logger.warning(f"Failed to calculate pricing for product {product.product_id}: {e}. " "Using defaults.")
+                logger.warning(f"Failed to calculate pricing for product {product.product_id}: {e}. Using defaults.")
                 # Leave defaults (floor_cpm, recommended_cpm, estimated_exposures remain None)
 
         return products
@@ -90,8 +90,17 @@ class DynamicPricingService:
         # Format IDs like "display_300x250" -> "300x250"
         creative_sizes = []
         for format_id in product.formats:
+            # Handle FormatId objects (dict or object with .id attribute)
+            # Pydantic validation may return dict, object, or string depending on context
+            if isinstance(format_id, dict):
+                format_id_str = format_id.get("id", "")
+            elif hasattr(format_id, "id"):
+                format_id_str = format_id.id
+            else:
+                format_id_str = str(format_id)
+
             # Extract size from format_id (e.g., "display_300x250" -> "300x250")
-            parts = format_id.split("_")
+            parts = format_id_str.split("_")
             if len(parts) >= 2:
                 # Look for dimensions pattern (NxM)
                 for part in parts:

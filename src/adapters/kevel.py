@@ -183,7 +183,12 @@ class Kevel(AdServerAdapter):
         return kevel_targeting
 
     def create_media_buy(
-        self, request: CreateMediaBuyRequest, packages: list[MediaPackage], start_time: datetime, end_time: datetime
+        self,
+        request: CreateMediaBuyRequest,
+        packages: list[MediaPackage],
+        start_time: datetime,
+        end_time: datetime,
+        package_pricing_info: dict[str, dict[str, Any]] | None = None,
     ) -> CreateMediaBuyResponse:
         """Creates a new Campaign and associated Flights in Kevel."""
         # Log operation
@@ -191,7 +196,7 @@ class Kevel(AdServerAdapter):
             operation="create_media_buy",
             principal_name=self.principal.name,
             principal_id=self.principal.principal_id,
-            adapter_id=self.advertiser_id,
+            adapter_id=self.advertiser_id or "unknown",
             success=True,
             details={"po_number": request.po_number, "flight_dates": f"{start_time.date()} to {end_time.date()}"},
         )
@@ -209,7 +214,10 @@ class Kevel(AdServerAdapter):
             error_msg = f"Unsupported targeting features for Kevel: {'; '.join(unsupported_features)}"
             self.log(f"[red]Error: {error_msg}[/red]")
             return CreateMediaBuyResponse(
-                buyer_ref=request.buyer_ref, errors=[Error(code="unsupported_targeting", message=error_msg)]
+                buyer_ref=request.buyer_ref or "unknown",
+                media_buy_id="",
+                creative_deadline=None,
+                errors=[Error(code="unsupported_targeting", message=error_msg, details={error_msg: error_msg})],
             )
 
         # Generate a media buy ID
@@ -276,7 +284,8 @@ class Kevel(AdServerAdapter):
             campaign_id = campaign_data["Id"]
             self.audit_logger.log_success(f"Created Kevel Campaign ID: {campaign_id}")
 
-            # Create flights for each package
+            # Create flights for each package and track flight IDs
+            package_responses = []
             for package in packages:
                 flight_payload = {
                     "Name": package.name,
@@ -310,15 +319,36 @@ class Kevel(AdServerAdapter):
 
                 flight_response = requests.post(f"{self.base_url}/flight", headers=self.headers, json=flight_payload)
                 flight_response.raise_for_status()
+                flight_data = flight_response.json()
+                flight_id = flight_data.get("Id")
+
+                # Build package response with package_id and platform_flight_id
+                package_responses.append(
+                    {
+                        "package_id": package.package_id,
+                        "platform_line_item_id": str(flight_id) if flight_id else None,
+                    }
+                )
 
             # Use the actual campaign ID from Kevel
             media_buy_id = f"kevel_{campaign_id}"
 
+        # For dry_run, build package responses without flight IDs
+        if self.dry_run:
+            package_responses = []
+            for package in packages:
+                package_responses.append(
+                    {
+                        "package_id": package.package_id,
+                    }
+                )
+
         return CreateMediaBuyResponse(
+            buyer_ref=request.buyer_ref or "unknown",
             media_buy_id=media_buy_id,
-            status="pending_activation",
-            detail=f"Created Kevel campaign with {len(packages)} flight(s)",
             creative_deadline=datetime.now() + timedelta(days=2),
+            packages=package_responses,
+            errors=[],
         )
 
     def add_creative_assets(
@@ -344,7 +374,7 @@ class Kevel(AdServerAdapter):
                     self.log("  Creative Payload: {")
                     self.log(f"    'Name': '{asset['name']}',")
                     self.log(
-                        f"    'Body': '<a href=\"{asset['click_url']}\" target=\"_blank\"><img src=\"{asset['media_url']}\"/></a>',"
+                        f'    \'Body\': \'<a href="{asset["click_url"]}" target="_blank"><img src="{asset["media_url"]}"/></a>\','
                     )
                     self.log(f"    'Url': '{asset['click_url']}'")
                     self.log("  }")
@@ -443,13 +473,17 @@ class Kevel(AdServerAdapter):
         """Checks the status of a media buy on Kevel."""
         self.log(f"Kevel.check_media_buy_status for media buy '{media_buy_id}'", dry_run_prefix=False)
 
+        # Note: buyer_ref would need to be retrieved from database or passed as parameter
+        # For now using media_buy_id as placeholder until interface is updated
+        buyer_ref = media_buy_id
+
         if self.dry_run:
             self.log(f"Would call: GET {self.base_url}/campaign/{media_buy_id}")
             self.log("Would check campaign IsActive status and flight statuses")
-            return CheckMediaBuyStatusResponse(media_buy_id=media_buy_id, status="active")
+            return CheckMediaBuyStatusResponse(media_buy_id=media_buy_id, buyer_ref=buyer_ref, status="active")
         else:
             # In production, would query campaign status
-            return CheckMediaBuyStatusResponse(media_buy_id=media_buy_id, status="active")
+            return CheckMediaBuyStatusResponse(media_buy_id=media_buy_id, buyer_ref=buyer_ref, status="active")
 
     def get_media_buy_delivery(
         self, media_buy_id: str, date_range: ReportingPeriod, today: datetime
@@ -459,19 +493,19 @@ class Kevel(AdServerAdapter):
             f"Kevel.get_media_buy_delivery for principal '{self.principal.name}' and media buy '{media_buy_id}'",
             dry_run_prefix=False,
         )
-        self.log(f"Date range: {date_range.start_date} to {date_range.end_date}", dry_run_prefix=False)
+        self.log(f"Date range: {date_range.start} to {date_range.end}", dry_run_prefix=False)
 
         if self.dry_run:
             self.log(f"Would call: POST {self.base_url}/report/queue")
             self.log("  Report Request: {")
-            self.log(f"    'StartDate': '{date_range.start_date.isoformat()}',")
-            self.log(f"    'EndDate': '{date_range.end_date.isoformat()}',")
+            self.log(f"    'StartDate': '{date_range.start.isoformat()}',")
+            self.log(f"    'EndDate': '{date_range.end.isoformat()}',")
             self.log("    'GroupBy': ['day', 'campaign', 'flight'],")
             self.log(f"    'Filter': {{'CampaignId': '{media_buy_id}'}}")
             self.log("  }")
 
             # Simulate response based on campaign progress
-            days_elapsed = (today.date() - date_range.start_date).days
+            days_elapsed = (today.date() - date_range.start).days
             progress_factor = min(days_elapsed / 14, 1.0)  # Assume 14-day campaigns
 
             # Calculate simulated delivery
@@ -481,13 +515,19 @@ class Kevel(AdServerAdapter):
             self.log(f"Would return: {impressions:,} impressions, ${spend:,.2f} spend")
 
             return AdapterGetMediaBuyDeliveryResponse(
-                totals=DeliveryTotals(impressions=impressions, spend=spend), by_package=[]
+                media_buy_id=media_buy_id,
+                reporting_period=date_range,
+                totals=DeliveryTotals(
+                    impressions=impressions, spend=spend, clicks=0, ctr=0.0, video_completions=0, completion_rate=0.0
+                ),
+                by_package=[],
+                currency="USD",
             )
         else:
             # Queue a report in Kevel
             report_request = {
-                "StartDate": date_range.start_date.isoformat(),
-                "EndDate": date_range.end_date.isoformat(),
+                "StartDate": date_range.start.isoformat(),
+                "EndDate": date_range.end.isoformat(),
                 "GroupBy": ["day", "campaign", "flight"],
                 "Filter": {"CampaignId": media_buy_id},
             }
@@ -511,7 +551,18 @@ class Kevel(AdServerAdapter):
             total_revenue = sum(row.get("Revenue", 0) for row in results.get("Records", []))
 
             return AdapterGetMediaBuyDeliveryResponse(
-                totals=DeliveryTotals(impressions=total_impressions, spend=total_revenue), by_package=[]
+                media_buy_id=media_buy_id,
+                reporting_period=date_range,
+                totals=DeliveryTotals(
+                    impressions=total_impressions,
+                    spend=total_revenue,
+                    clicks=0,
+                    ctr=0.0,
+                    video_completions=0,
+                    completion_rate=0.0,
+                ),
+                by_package=[],
+                currency="USD",
             )
 
     def update_media_buy_performance_index(

@@ -161,7 +161,6 @@ class GetProductsResponse(AdCPBaseModel):
 
     # Fields from generated schema (flexible - accepts dicts or objects)
     products: list[Any] = Field(..., description="List of matching products")
-    status: str | None = Field(None, description="Response status")
     errors: list[Any] | None = Field(None, description="Task-specific errors")
 
     def __str__(self) -> str:
@@ -373,7 +372,6 @@ class ListCreativeFormatsResponse(AdCPBaseModel):
 
     # Fields from generated schema (flexible - accepts dicts or objects)
     formats: list[Any] = Field(..., description="Full format definitions per AdCP spec")
-    status: str | None = Field("completed", description="Task status")
     creative_agents: list[Any] | None = Field(None, description="Creative agents providing additional formats")
     errors: list[Any] | None = Field(None, description="Task-specific errors and warnings")
 
@@ -688,18 +686,26 @@ class GetMediaBuyDeliveryResponse(AdCPBaseModel):
 
 
 class GetSignalsResponse(AdCPBaseModel):
-    """Adapter for GetSignalsResponse - adds __str__()."""
+    """Adapter for GetSignalsResponse - adds __str__().
+
+    Per AdCP PR #113 and official schema, protocol fields (message, context_id)
+    are added by the protocol layer, not the domain response.
+    """
 
     model_config = {"arbitrary_types_allowed": True}
 
-    message: str = Field(..., description="Human-readable summary")
-    context_id: str = Field(..., description="Session continuity identifier")
     signals: list[Any] = Field(..., description="Array of matching signals")
     errors: list[Any] | None = None
 
     def __str__(self) -> str:
-        """Return message field (it's in the spec for this one)."""
-        return self.message
+        """Return human-readable summary of signals."""
+        count = len(self.signals)
+        if count == 0:
+            return "No signals found matching your criteria."
+        elif count == 1:
+            return "Found 1 signal matching your criteria."
+        else:
+            return f"Found {count} signals matching your criteria."
 
 
 # ============================================================================
@@ -750,7 +756,6 @@ class ListCreativesResponse(AdCPBaseModel):
     query_summary: Any = Field(..., description="Summary of the query")
     pagination: Any = Field(..., description="Pagination information")
     creatives: list[Any] = Field(..., description="Array of creative assets")
-    context_id: str | None = None
     format_summary: dict[str, int] | None = None
     status_summary: dict[str, int] | None = None
 

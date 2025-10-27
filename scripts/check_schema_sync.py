@@ -50,7 +50,7 @@ class SchemaSyncChecker:
         self.updates_applied: list[str] = []
 
         # Local schema cache directory
-        self.cache_dir = Path("tests/e2e/schemas/v1")
+        self.cache_dir = Path("schemas/v1")
 
         # HTTP client for fetching live schemas
         self.http_client = httpx.AsyncClient(timeout=30.0)
@@ -220,6 +220,7 @@ class SchemaSyncChecker:
 
         with open(cache_path, "w") as f:
             json.dump(schema_data, f, indent=2)
+            f.write("\n")  # Add trailing newline for pre-commit compatibility
 
     def _schemas_are_equal(self, schema1: dict[str, Any], schema2: dict[str, Any]) -> bool:
         """Compare two schemas for equality (ignoring metadata)."""
@@ -346,6 +347,7 @@ class SchemaSyncChecker:
                     if self.auto_update:
                         with open(cached_index_path, "w") as f:
                             json.dump(live_index, f, indent=2)
+                            f.write("\n")  # Add trailing newline for pre-commit compatibility
                         self.log_update(f"Updated index version: {live_version}")
                     return False
                 else:
@@ -356,6 +358,7 @@ class SchemaSyncChecker:
                 if self.auto_update:
                     with open(cached_index_path, "w") as f:
                         json.dump(live_index, f, indent=2)
+                        f.write("\n")  # Add trailing newline for pre-commit compatibility
                     self.log_update("Downloaded missing index")
                 return False
 

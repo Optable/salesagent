@@ -249,7 +249,7 @@ class AssetRequirement(BaseModel):
     asset_type: str = Field(..., description="Type of asset required")
     asset_role: str | None = Field(None, description="Optional descriptive label (not used for referencing)")
     required: bool = Field(True, description="Whether this asset is required")
-    quantity: int = Field(1, minimum=1, description="Number of assets of this type required")
+    quantity: int = Field(default=1, ge=1, description="Number of assets of this type required")
     requirements: dict[str, Any] | None = Field(None, description="Specific requirements for this asset type")
 
 
@@ -406,7 +406,7 @@ def convert_format_ids_to_formats(format_ids: list[str], tenant_id: str | None =
         else:
             # For unknown format IDs, create a minimal Format object with FormatId
             formats.append(
-                Format(
+                Format(  # type: ignore[call-arg]
                     format_id=FormatId(agent_url="https://creative.adcontextprotocol.org", id=format_id),
                     name=format_id.replace("_", " ").title(),
                     type="display",  # Default to display
@@ -1341,28 +1341,32 @@ class Creative(BaseModel):
     template_variables: dict[str, Any] | None = Field(
         None,
         description="Variables for native ad templates per AdCP spec",
-        example={
-            "headline": "Amazing Product",
-            "body": "This product will change your life",
-            "main_image_url": "https://cdn.example.com/product.jpg",
-            "logo_url": "https://cdn.example.com/logo.png",
-            "cta_text": "Shop Now",
-            "advertiser_name": "Brand Name",
-            "price": "$99.99",
-            "star_rating": "4.5",
-        },
+        examples=[
+            {
+                "headline": "Amazing Product",
+                "body": "This product will change your life",
+                "main_image_url": "https://cdn.example.com/product.jpg",
+                "logo_url": "https://cdn.example.com/logo.png",
+                "cta_text": "Shop Now",
+                "advertiser_name": "Brand Name",
+                "price": "$99.99",
+                "star_rating": "4.5",
+            }
+        ],
     )
 
     # Platform-specific extension (not in core AdCP spec)
     delivery_settings: dict[str, Any] | None = Field(
         None,
         description="Platform-specific delivery configuration (extension)",
-        example={
-            "safe_frame_compatible": True,
-            "ssl_required": True,
-            "orientation_lock": "FREE_ORIENTATION",
-            "tracking_urls": ["https://..."],
-        },
+        examples=[
+            {
+                "safe_frame_compatible": True,
+                "ssl_required": True,
+                "orientation_lock": "FREE_ORIENTATION",
+                "tracking_urls": ["https://..."],
+            }
+        ],
     )
 
     # Internal fields (not in AdCP spec, but available for internal use)
@@ -1384,11 +1388,11 @@ class Creative(BaseModel):
         This property will be removed in a future version.
         """
         warnings.warn(
-            "format_id is deprecated and will be removed in a future version. " "Use format instead.",
+            "format_id is deprecated and will be removed in a future version. Use format instead.",
             DeprecationWarning,
             stacklevel=2,
         )
-        return self.format
+        return self.format.id
 
     @property
     def content_uri(self) -> str:
@@ -1398,7 +1402,7 @@ class Creative(BaseModel):
         This property will be removed in a future version.
         """
         warnings.warn(
-            "content_uri is deprecated and will be removed in a future version. " "Use url instead.",
+            "content_uri is deprecated and will be removed in a future version. Use url instead.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -1412,7 +1416,7 @@ class Creative(BaseModel):
         This property will be removed in a future version.
         """
         warnings.warn(
-            "click_through_url is deprecated and will be removed in a future version. " "Use click_url instead.",
+            "click_through_url is deprecated and will be removed in a future version. Use click_url instead.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -1532,14 +1536,16 @@ class Creative(BaseModel):
         """Get the primary content URL for hosted assets."""
         return self.media_url or self.url
 
-    def set_third_party_snippet(self, snippet: str, snippet_type: str, settings: dict = None):
+    def set_third_party_snippet(self, snippet: str, snippet_type: str, settings: dict[str, Any] | None = None) -> None:
         """Convenience method to set up a third-party tag creative (AdCP v1.3+)."""
         self.snippet = snippet
-        self.snippet_type = snippet_type
+        self.snippet_type = snippet_type  # type: ignore[assignment]
         if settings:
             self.delivery_settings = settings
 
-    def set_native_template_variables(self, template_vars: dict[str, Any], settings: dict = None):
+    def set_native_template_variables(
+        self, template_vars: dict[str, Any], settings: dict[str, Any] | None = None
+    ) -> None:
         """Convenience method to set up a native creative (AdCP v1.3+)."""
         self.template_variables = template_vars
         if settings:
@@ -2219,7 +2225,9 @@ class Package(BaseModel):
 # --- Media Buy Lifecycle ---
 class CreateMediaBuyRequest(AdCPBaseModel):
     # Required AdCP v2.2.0 fields (per https://adcontextprotocol.org/schemas/v1/media-buy/create-media-buy-request.json)
-    buyer_ref: str = Field(..., description="Buyer reference for tracking (REQUIRED per AdCP spec)")
+    buyer_ref: str | None = Field(
+        None, description="Buyer reference for tracking (optional, buyer-provided identifier)"
+    )
     brand_manifest: "BrandManifest | str" = Field(
         ...,
         description="Brand information manifest (inline object or URL string). REQUIRED per AdCP v2.2.0 spec.",
@@ -2297,7 +2305,7 @@ class CreateMediaBuyRequest(AdCPBaseModel):
             # Note: AdCP create-media-buy-request only requires products from client
             # Server generates package_id and initial status per AdCP package schema
             # buyer_ref is optional and should only be set by the buyer/client
-            product_ids = values.get("product_ids", [])
+            product_ids = values.get("product_ids") or []  # Handle None
             packages = []
             for i, pid in enumerate(product_ids):
                 package_uuid = uuid.uuid4().hex[:6]
@@ -2305,7 +2313,7 @@ class CreateMediaBuyRequest(AdCPBaseModel):
                     {
                         "package_id": f"pkg_{i}_{package_uuid}",  # Server-generated per AdCP spec
                         # buyer_ref is NOT auto-generated - it's the buyer's identifier
-                        "products": [pid],
+                        "product_id": pid,  # Use product_id (singular) per current validation
                         "status": "draft",  # Server sets initial status per AdCP package schema
                     }
                 )
@@ -2366,12 +2374,14 @@ class CreateMediaBuyRequest(AdCPBaseModel):
 
     # Backward compatibility properties for old field names
     @property
-    def flight_start_date(self) -> date:
+    def flight_start_date(self) -> date | None:
         """Backward compatibility for old field name."""
-        return self.start_time.date() if self.start_time else None
+        if isinstance(self.start_time, datetime):
+            return self.start_time.date()
+        return None
 
     @property
-    def flight_end_date(self) -> date:
+    def flight_end_date(self) -> date | None:
         """Backward compatibility for old field name."""
         return self.end_time.date() if self.end_time else None
 
@@ -2657,6 +2667,9 @@ class MediaPackage(BaseModel):
     impressions: int
     format_ids: list[FormatId]  # FormatId objects per AdCP spec
     targeting_overlay: Optional["Targeting"] = None
+    buyer_ref: str | None = None  # Optional buyer reference from request package
+    product_id: str | None = None  # Product ID for this package
+    budget: Optional["Budget"] = None  # Budget information from request
 
 
 class PackagePerformance(BaseModel):
@@ -2724,7 +2737,7 @@ class PackageUpdate(BaseModel):
 
     package_id: str
     active: bool | None = None  # True to activate, False to pause
-    budget: float | None = None  # New budget in dollars
+    budget: Budget | float | None = None  # Budget object (AdCP spec) or legacy float
     impressions: int | None = None  # Direct impression goal (overrides budget calculation)
     cpm: float | None = None  # Update CPM rate
     daily_budget: float | None = None  # Daily spend cap
@@ -2811,7 +2824,7 @@ class UpdateMediaBuyRequest(AdCPBaseModel):
     @property
     def flight_start_date(self) -> date | None:
         """DEPRECATED: Use start_time instead. Backward compatibility only."""
-        if self.start_time:
+        if isinstance(self.start_time, datetime):
             warnings.warn("flight_start_date is deprecated. Use start_time instead.", DeprecationWarning, stacklevel=2)
             return self.start_time.date()
         return None
@@ -3067,7 +3080,7 @@ class Signal(BaseModel):
         This property will be removed in a future version.
         """
         warnings.warn(
-            "signal_id is deprecated and will be removed in a future version. " "Use signal_agent_segment_id instead.",
+            "signal_id is deprecated and will be removed in a future version. Use signal_agent_segment_id instead.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -3081,7 +3094,7 @@ class Signal(BaseModel):
         This property will be removed in a future version.
         """
         warnings.warn(
-            "type is deprecated and will be removed in a future version. " "Use signal_type instead.",
+            "type is deprecated and will be removed in a future version. Use signal_type instead.",
             DeprecationWarning,
             stacklevel=2,
         )

@@ -107,7 +107,9 @@ class TestLineItemTypeSelection:
         """Override VCPM with non-STANDARD type should be rejected."""
         with pytest.raises(ValueError, match="not compatible with pricing model 'vcpm'"):
             PricingCompatibility.select_line_item_type(
-                "vcpm", is_guaranteed=False, override_type="SPONSORSHIP"  # SPONSORSHIP doesn't support VCPM
+                "vcpm",
+                is_guaranteed=False,
+                override_type="SPONSORSHIP",  # SPONSORSHIP doesn't support VCPM
             )
 
 

@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from sqlalchemy import select
 
-from src.admin.utils import require_auth, require_tenant_access
+from src.admin.utils import require_auth, require_tenant_access  # type: ignore[attr-defined]
 from src.admin.utils.audit_decorator import log_admin_action
 from src.core.database.database_session import get_db_session
 from src.core.database.models import Tenant
@@ -351,9 +351,12 @@ def update_adapter(tenant_id):
             elif new_adapter == "mock":
                 if request.is_json:
                     dry_run = request.json.get("mock_dry_run", False)
+                    manual_approval = request.json.get("mock_manual_approval", False)
                 else:
                     dry_run = request.form.get("mock_dry_run") == "on"
+                    manual_approval = request.form.get("mock_manual_approval") == "on"
                 adapter_config_obj.mock_dry_run = dry_run
+                adapter_config_obj.mock_manual_approval_required = manual_approval
 
             # Update the tenant
             tenant.ad_server = new_adapter
@@ -877,10 +880,18 @@ def update_business_rules(tenant_id):
 
             # Update approval workflow
             if "human_review_required" in data:
-                tenant.human_review_required = data.get("human_review_required") in [True, "true", "on", 1, "1"]
+                manual_approval_value = data.get("human_review_required") in [True, "true", "on", 1, "1"]
+                tenant.human_review_required = manual_approval_value
+
+                # Also update the adapter's manual approval setting if using Mock adapter
+                if tenant.adapter_config and tenant.adapter_config.adapter_type == "mock":
+                    tenant.adapter_config.mock_manual_approval_required = manual_approval_value
             elif not request.is_json:
                 # Checkbox not present in form data means unchecked
                 tenant.human_review_required = False
+                # Also update Mock adapter setting if applicable
+                if tenant.adapter_config and tenant.adapter_config.adapter_type == "mock":
+                    tenant.adapter_config.mock_manual_approval_required = False
 
             # Update creative review settings
             if "approval_mode" in data:
@@ -1205,7 +1216,7 @@ def unregister_approximated_domain(tenant_id):
 @settings_bp.route("/approximated-token", methods=["POST"])
 @require_tenant_access()
 def get_approximated_token(tenant_id):
-    """Generate an Approximated DNS widget token."""
+    """Generate an Approximated DNS widget token and get DNS target."""
     try:
         import requests
 
@@ -1214,6 +1225,10 @@ def get_approximated_token(tenant_id):
         if not approximated_api_key:
             logger.error("APPROXIMATED_API_KEY not configured in environment")
             return jsonify({"success": False, "error": "DNS widget not configured on server"}), 500
+
+        # Get the Approximated proxy IP from environment
+        # This is the IP address of your Approximated proxy cluster
+        approximated_proxy_ip = os.getenv("APPROXIMATED_PROXY_IP", "37.16.24.200")
 
         with get_db_session() as db_session:
             tenant = db_session.scalars(select(Tenant).filter_by(tenant_id=tenant_id)).first()
@@ -1230,7 +1245,7 @@ def get_approximated_token(tenant_id):
             if response.status_code == 200:
                 token_data = response.json()
                 logger.info(f"Approximated API response: {token_data}")
-                return jsonify({"success": True, "token": token_data.get("token")})
+                return jsonify({"success": True, "token": token_data.get("token"), "proxy_ip": approximated_proxy_ip})
             else:
                 logger.error(f"Approximated API error: {response.status_code} - {response.text}")
                 return jsonify({"success": False, "error": f"API error: {response.status_code}"}), response.status_code

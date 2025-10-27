@@ -27,12 +27,37 @@ DB_URL = os.environ.get(
 
 @pytest.mark.integration
 @pytest.mark.requires_db
-def test_database_queries():
+def test_database_queries(integration_db):
     """Test the actual database queries used by the settings page"""
     print("\n🔍 Testing database queries...")
 
+    # Get DATABASE_URL from environment (set by integration_db fixture)
+    db_url = os.environ.get("DATABASE_URL")
+
+    # Create test data first
+    from src.core.database.database_session import get_db_session
+    from src.core.database.models import Principal, Tenant
+
+    tenant_id = "default"
+
+    with get_db_session() as session:
+        # Create tenant
+        tenant = Tenant(tenant_id=tenant_id, name="Test Tenant", subdomain="test-tenant")
+        session.add(tenant)
+
+        # Create principal
+        principal = Principal(
+            tenant_id=tenant_id,
+            principal_id="test_principal",
+            name="Test Principal",
+            access_token="test_token",
+            platform_mappings={"mock": {"advertiser_id": "test-advertiser"}},
+        )
+        session.add(principal)
+        session.commit()
+
     try:
-        conn = psycopg2.connect(DB_URL, cursor_factory=DictCursor)
+        conn = psycopg2.connect(db_url, cursor_factory=DictCursor)
         cursor = conn.cursor()
 
         # Test 1: Check products table structure
@@ -43,7 +68,7 @@ def test_database_queries():
             FROM products
             WHERE tenant_id = %s
         """,
-            ("default",),
+            (tenant_id,),
         )
         result = cursor.fetchone()
         print(f"   ✓ Products count: {result['total_products']}")
@@ -57,7 +82,7 @@ def test_database_queries():
             WHERE tenant_id = %s
             AND created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'
         """,
-            ("default",),
+            (tenant_id,),
         )
         result = cursor.fetchone()
         print(f"   ✓ Active advertisers: {result[0]}")
@@ -76,7 +101,7 @@ def test_database_queries():
             FROM principals
             WHERE tenant_id = %s
         """,
-            ("default",),
+            (tenant_id,),
         )
         result = cursor.fetchone()
         print(f"   ✓ Total principals: {result['total_principals']}")
@@ -87,10 +112,11 @@ def test_database_queries():
             cursor.execute(
                 """
                 SELECT COUNT(*) as pending_workflow_steps
-                FROM workflow_steps
-                WHERE tenant_id = %s AND status = 'requires_approval'
+                FROM workflow_steps ws
+                JOIN contexts c ON ws.context_id = c.context_id
+                WHERE c.tenant_id = %s AND ws.status = 'requires_approval'
             """,
-                ("default",),
+                (tenant_id,),
             )
             result = cursor.fetchone()
             print(f"   ✓ Pending workflow steps: {result['pending_workflow_steps']}")
@@ -100,11 +126,10 @@ def test_database_queries():
         cursor.close()
         conn.close()
         print("\n✅ All database queries successful!")
-        return True
 
     except Exception as e:
         print(f"\n❌ Database error: {e}")
-        return False
+        pytest.fail(f"Database error: {e}")
 
 
 @pytest.mark.integration
@@ -126,7 +151,7 @@ def test_settings_page():
         print("   ✓ Authentication successful")
     else:
         print(f"   ❌ Authentication failed: {response.status_code}")
-        return False
+        pytest.fail(f"Authentication failed: {response.status_code}")
 
     # Test settings page
     print("\n2. Testing settings page...")
@@ -164,10 +189,10 @@ def test_settings_page():
             for line in lines:
                 if "error" in line.lower() or "exception" in line.lower():
                     print(f"     {line.strip()[:200]}")
-        return False
+        pytest.fail("Settings page returned 500 error")
     else:
         print(f"   ⚠️  Unexpected status: {response.status_code}")
-        return False
+        pytest.fail(f"Unexpected status: {response.status_code}")
 
     # Test dashboard page
     print("\n3. Testing dashboard page...")
@@ -178,9 +203,7 @@ def test_settings_page():
         print("   ✓ Dashboard loaded successfully")
     elif response.status_code == 500:
         print("   ❌ Dashboard server error (500)")
-        return False
-
-    return True
+        pytest.fail("Dashboard page returned 500 error")
 
 
 def main():

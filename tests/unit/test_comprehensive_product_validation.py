@@ -154,12 +154,12 @@ async def test_all_providers():
             traceback.print_exc()
             all_passed = False
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     if all_passed:
         print("🎉 ALL TESTS PASSED! All product catalog providers create valid Product objects.")
     else:
         print("💥 SOME TESTS FAILED! There are Product validation issues.")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     return all_passed
 

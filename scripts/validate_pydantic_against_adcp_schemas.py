@@ -5,7 +5,7 @@ Validate Pydantic Models Against AdCP JSON Schemas
 This script ensures our Pydantic response models match the official AdCP specification
 by comparing field names, types, and requirements between:
 - Pydantic models in src/core/schemas.py
-- AdCP JSON schemas in tests/e2e/schemas/v1/
+- AdCP JSON schemas in schemas/v1/
 
 This prevents spec drift and ensures buyer compatibility.
 
@@ -79,7 +79,7 @@ class PydanticSchemaValidator:
         self.verbose = verbose
         self.errors = []
         self.warnings = []
-        self.schema_dir = Path("tests/e2e/schemas/v1")
+        self.schema_dir = Path("schemas/v1")
         self.schemas_file = Path("src/core/schemas.py")
 
     def log_error(self, msg: str):
@@ -243,9 +243,9 @@ class PydanticSchemaValidator:
             print()  # Blank line between validations
 
         # Summary
-        print(f"\n{Colors.BOLD}{'='*60}{Colors.RESET}")
+        print(f"\n{Colors.BOLD}{'=' * 60}{Colors.RESET}")
         print(f"{Colors.BOLD}Validation Summary{Colors.RESET}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Models validated: {validated_count}")
         print(f"{Colors.RED}Errors: {len(self.errors)}{Colors.RESET}")
         print(f"{Colors.YELLOW}Warnings: {len(self.warnings)}{Colors.RESET}")

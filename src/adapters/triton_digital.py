@@ -113,7 +113,12 @@ class TritonDigital(AdServerAdapter):
         return triton_targeting
 
     def create_media_buy(
-        self, request: CreateMediaBuyRequest, packages: list[MediaPackage], start_time: datetime, end_time: datetime
+        self,
+        request: CreateMediaBuyRequest,
+        packages: list[MediaPackage],
+        start_time: datetime,
+        end_time: datetime,
+        package_pricing_info: dict[str, dict[str, Any]] | None = None,
     ) -> CreateMediaBuyResponse:
         """Creates a new Campaign and Flights in the Triton TAP API."""
         # Log operation
@@ -121,7 +126,7 @@ class TritonDigital(AdServerAdapter):
             operation="create_media_buy",
             principal_name=self.principal.name,
             principal_id=self.principal.principal_id,
-            adapter_id=self.advertiser_id,
+            adapter_id=self.advertiser_id or "unknown",
             success=True,
             details={"po_number": request.po_number, "flight_dates": f"{start_time.date()} to {end_time.date()}"},
         )
@@ -139,7 +144,8 @@ class TritonDigital(AdServerAdapter):
             error_msg = f"Unsupported targeting features for Triton Digital: {'; '.join(unsupported_features)}"
             self.log(f"[red]Error: {error_msg}[/red]")
             return CreateMediaBuyResponse(
-                buyer_ref=request.buyer_ref, errors=[Error(code="unsupported_targeting", message=error_msg)]
+                buyer_ref=request.buyer_ref or "unknown",
+                errors=[Error(code="unsupported_targeting", message=error_msg)],
             )
 
         # Generate a media buy ID
@@ -200,7 +206,8 @@ class TritonDigital(AdServerAdapter):
             campaign_data = response.json()
             campaign_id = campaign_data["id"]
 
-            # Create flights for each package
+            # Create flights for each package and track flight IDs
+            package_responses = []
             for package in packages:
                 flight_payload = {
                     "name": package.name,
@@ -223,15 +230,36 @@ class TritonDigital(AdServerAdapter):
 
                 flight_response = requests.post(f"{self.base_url}/flights", headers=self.headers, json=flight_payload)
                 flight_response.raise_for_status()
+                flight_data = flight_response.json()
+                flight_id = flight_data.get("id")
+
+                # Build package response with package_id and platform_flight_id
+                package_responses.append(
+                    {
+                        "package_id": package.package_id,
+                        "platform_line_item_id": str(flight_id) if flight_id else None,
+                    }
+                )
 
             # Use the actual campaign ID from Triton
             media_buy_id = f"triton_{campaign_id}"
 
+        # For dry_run, build package responses without flight IDs
+        if self.dry_run:
+            package_responses = []
+            for package in packages:
+                package_responses.append(
+                    {
+                        "package_id": package.package_id,
+                    }
+                )
+
         return CreateMediaBuyResponse(
+            buyer_ref=request.buyer_ref or "unknown",
             media_buy_id=media_buy_id,
-            status="pending_activation",
-            detail=f"Created Triton campaign with {len(packages)} flight(s)",
             creative_deadline=datetime.now() + timedelta(days=2),
+            packages=package_responses,
+            errors=[],
         )
 
     def add_creative_assets(
@@ -368,21 +396,21 @@ class TritonDigital(AdServerAdapter):
             f"TritonDigital.get_media_buy_delivery for principal '{self.principal.name}' and media buy '{media_buy_id}'",
             dry_run_prefix=False,
         )
-        self.log(f"Date range: {date_range.start_date} to {date_range.end_date}", dry_run_prefix=False)
+        self.log(f"Date range: {date_range.start} to {date_range.end}", dry_run_prefix=False)
 
         if self.dry_run:
             self.log(f"Would call: POST {self.base_url}/reports")
             self.log("  Report Request: {")
             self.log("    'reportType': 'FLIGHT',")
-            self.log(f"    'startDate': '{date_range.start_date.isoformat()}',")
-            self.log(f"    'endDate': '{date_range.end_date.isoformat()}',")
+            self.log(f"    'startDate': '{date_range.start.isoformat()}',")
+            self.log(f"    'endDate': '{date_range.end.isoformat()}',")
             self.log(f"    'filters': {{'campaigns': ['{media_buy_id}']}},")
             self.log("    'columns': ['flightName', 'impressions', 'totalRevenue']")
             self.log("  }")
             self.log("Would poll for report completion and download results")
 
             # Simulate response based on campaign progress
-            days_elapsed = (today.date() - date_range.start_date).days
+            days_elapsed = (today.date() - date_range.start).days
             progress_factor = min(days_elapsed / 14, 1.0)  # Assume 14-day campaigns
 
             # Calculate simulated delivery for audio campaigns
@@ -392,13 +420,19 @@ class TritonDigital(AdServerAdapter):
             self.log(f"Would return: {impressions:,} impressions, ${spend:,.2f} spend")
 
             return AdapterGetMediaBuyDeliveryResponse(
-                totals=DeliveryTotals(impressions=impressions, spend=spend), by_package=[]
+                media_buy_id=media_buy_id,
+                reporting_period=date_range,
+                totals=DeliveryTotals(
+                    impressions=impressions, spend=spend, clicks=0, ctr=0.0, video_completions=0, completion_rate=0.0
+                ),
+                by_package=[],
+                currency="USD",
             )
         else:
             report_payload = {
                 "reportType": "FLIGHT",
-                "startDate": date_range.start_date.isoformat(),
-                "endDate": date_range.end_date.isoformat(),
+                "startDate": date_range.start.isoformat(),
+                "endDate": date_range.end.isoformat(),
                 "filters": {"campaigns": [media_buy_id]},
                 "columns": ["flightName", "impressions", "totalRevenue"],
             }
@@ -447,7 +481,18 @@ class TritonDigital(AdServerAdapter):
                     by_package.append(PackageDelivery(package_id=package_name, impressions=impressions, spend=spend))
 
                 return AdapterGetMediaBuyDeliveryResponse(
-                    totals=DeliveryTotals(impressions=total_impressions, spend=total_spend), by_package=by_package
+                    media_buy_id=media_buy_id,
+                    reporting_period=date_range,
+                    totals=DeliveryTotals(
+                        impressions=total_impressions,
+                        spend=total_spend,
+                        clicks=0,
+                        ctr=0.0,
+                        video_completions=0,
+                        completion_rate=0.0,
+                    ),
+                    by_package=by_package,
+                    currency="USD",
                 )
 
             except requests.exceptions.RequestException as e:

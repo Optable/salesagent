@@ -100,8 +100,10 @@ class MediaBuyReadinessService:
             packages_total = len(packages)
 
             # Get creative assignments for this media buy
-            stmt = select(CreativeAssignment).filter_by(tenant_id=tenant_id, media_buy_id=media_buy_id)
-            assignments = session.scalars(stmt).all()
+            from typing import cast
+
+            assignments_stmt = select(CreativeAssignment).filter_by(tenant_id=tenant_id, media_buy_id=media_buy_id)
+            assignments = cast(list, session.scalars(assignments_stmt).all())
 
             # Get unique package IDs that have creative assignments
             packages_with_assignments = {a.package_id for a in assignments}
@@ -112,10 +114,12 @@ class MediaBuyReadinessService:
             creatives_total = len(creative_ids)
 
             # Get creative statuses
-            creatives = []
+            creatives: list[Creative] = []
             if creative_ids:
-                stmt = select(Creative).filter(Creative.tenant_id == tenant_id, Creative.creative_id.in_(creative_ids))
-                creatives = session.scalars(stmt).all()
+                creatives_stmt = select(Creative).filter(
+                    Creative.tenant_id == tenant_id, Creative.creative_id.in_(creative_ids)
+                )
+                creatives = list(session.scalars(creatives_stmt).all())
 
             creatives_approved = sum(1 for c in creatives if c.status == "approved")
             creatives_pending = sum(1 for c in creatives if c.status == "pending")
@@ -236,11 +240,11 @@ class MediaBuyReadinessService:
         State hierarchy (in priority order):
         1. failed - Media buy creation failed
         2. paused - Explicitly paused
-        3. completed - Flight ended
-        4. live - Currently serving (in flight, all creatives approved, no blockers)
-        5. scheduled - Ready and waiting for start date
-        6. needs_approval - Has pending creatives
-        7. needs_creatives - Missing creative assignments or has rejected creatives
+        3. needs_approval - Media buy itself awaiting manual approval (NOT creative approval)
+        4. completed - Flight ended
+        5. live - Currently serving (in flight, all creatives approved, no blockers)
+        6. scheduled - Ready and waiting for start date
+        7. needs_creatives - Creatives need action (missing, pending approval, or rejected)
         8. draft - Initial state, not configured
         """
         # Check explicit status first
@@ -249,6 +253,10 @@ class MediaBuyReadinessService:
 
         if media_buy.status == "paused":
             return "paused"
+
+        # Check if awaiting manual approval (highest priority - bypasses creative checks)
+        if media_buy.status == "pending_approval":
+            return "needs_approval"
 
         # Check flight timing - ensure timezone-aware datetimes
         if media_buy.start_time:
@@ -282,12 +290,14 @@ class MediaBuyReadinessService:
         if packages_total == 0:
             return "draft"
 
-        # Needs approval: has pending creatives
-        if creatives_pending > 0:
-            return "needs_approval"
-
-        # Needs creatives: missing assignments, has rejected creatives, or has packages but no creatives
-        if packages_total > packages_with_creatives or creatives_rejected > 0 or creatives_total == 0:
+        # Needs creatives: ANY creative action needed (missing, pending, or rejected)
+        # This includes creatives pending approval - they are still in "needs creatives" state
+        if (
+            packages_total > packages_with_creatives  # Missing creative assignments
+            or creatives_pending > 0  # Creatives pending approval
+            or creatives_rejected > 0  # Rejected creatives need replacement
+            or creatives_total == 0  # No creatives at all
+        ):
             return "needs_creatives"
 
         # Fallback (shouldn't reach here if logic is complete)

@@ -49,13 +49,13 @@ class A2AResponseValidator:
         "metadata",
     }
 
-    # Skill-specific required fields
+    # Skill-specific required fields (domain fields only - protocol fields added by handlers)
     SKILL_REQUIRED_FIELDS = {
-        "create_media_buy": {"media_buy_id", "status", "packages"},
-        "sync_creatives": {"status", "results"},
+        "create_media_buy": set(),  # media_buy_id is optional per schema, removed as required
+        "sync_creatives": {"creatives"},  # Removed 'status' (protocol), 'results' -> 'creatives' per spec
         "get_products": {"products"},
-        "list_creatives": {"creatives", "total_count", "page", "limit"},
-        "list_creative_formats": {"formats", "total_count"},
+        "list_creatives": {"creatives", "query_summary", "pagination"},  # Per AdCP spec structure
+        "list_creative_formats": {"formats"},  # Removed 'total_count' (not in spec)
         "get_signals": {"signals"},
     }
 
@@ -172,8 +172,7 @@ class A2AResponseValidator:
             )
         elif not has_str_method:
             warnings.append(
-                f"{class_name} only has .message field, no __str__() method. "
-                f"Consider adding __str__() for consistency."
+                f"{class_name} only has .message field, no __str__() method. Consider adding __str__() for consistency."
             )
 
         return ValidationResult(is_valid=len(errors) == 0, errors=errors, warnings=warnings)

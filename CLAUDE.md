@@ -7,7 +7,7 @@
 
 **Schema Hierarchy:**
 1. **Official Spec** (https://adcontextprotocol.org/schemas/v1/) - Primary source of truth
-2. **Cached Schemas** (`tests/e2e/schemas/v1/`) - Checked into git for offline validation
+2. **Cached Schemas** (`schemas/v1/`) - Checked into git for offline validation
 3. **Pydantic Schemas** (`src/core/schemas.py`) - MUST match official spec exactly
 
 **Rules:**
@@ -33,7 +33,7 @@ pytest tests/e2e/test_adcp_compliance.py -v
 pytest tests/unit/test_adcp_contract.py -v
 
 # If schemas are out of date, cached files are auto-updated on next run
-# Commit any schema file changes that appear in tests/e2e/schemas/v1/
+# Commit any schema file changes that appear in schemas/v1/
 ```
 
 **Current Schema Version:**
@@ -516,9 +516,17 @@ SUPER_ADMIN_EMAILS=user@example.com
 # GAM OAuth
 GAM_OAUTH_CLIENT_ID=your-gam-id.apps.googleusercontent.com
 GAM_OAUTH_CLIENT_SECRET=your-gam-secret
+
+# Approximated (Custom Domains)
+APPROXIMATED_API_KEY=your-approximated-api-key
+APPROXIMATED_PROXY_IP=37.16.24.200  # IP address of Approximated proxy cluster
+APPROXIMATED_BACKEND_URL=adcp-sales-agent.fly.dev  # Your backend server URL
 ```
 
-**Note**: Ports auto-configured by workspace setup script.
+**Note**:
+- Ports auto-configured by workspace setup script.
+- `APPROXIMATED_PROXY_IP`: The IP address that clients should point their custom domains to via A record (your Approximated proxy cluster)
+- `APPROXIMATED_BACKEND_URL`: Your actual backend server URL that Approximated proxies to
 
 ### Database Schema
 ```sql

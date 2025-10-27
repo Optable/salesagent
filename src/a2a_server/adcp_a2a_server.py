@@ -4,10 +4,10 @@ AdCP Sales Agent A2A Server using official a2a-sdk library.
 Supports both standard A2A message format and JSON-RPC 2.0.
 """
 
+import contextvars
 import logging
 import os
 import sys
-import threading
 import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -31,6 +31,7 @@ from a2a.server.request_handlers.request_handler import RequestHandler
 from a2a.types import (
     AgentCard,
     Artifact,
+    DataPart,
     InternalError,
     InvalidParamsError,
     InvalidRequestError,
@@ -63,7 +64,7 @@ from src.core.schemas import (
     GetSignalsRequest,
     ListAuthorizedPropertiesRequest,
 )
-from src.core.testing_hooks import TestingContext
+from src.core.testing_hooks import AdCPTestContext
 from src.core.tool_context import ToolContext
 from src.core.tools import (
     create_media_buy_raw as core_create_media_buy_tool,
@@ -101,8 +102,9 @@ from src.services.protocol_webhook_service import get_protocol_webhook_service
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Thread-local storage for current request auth token
-_request_context = threading.local()
+# Context variables for current request (works with async code, unlike threading.local())
+_request_auth_token: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_auth_token", default=None)
+_request_headers: contextvars.ContextVar[dict | None] = contextvars.ContextVar("request_headers", default=None)
 
 
 class AdCPRequestHandler(RequestHandler):
@@ -115,13 +117,15 @@ class AdCPRequestHandler(RequestHandler):
 
     def _get_auth_token(self) -> str | None:
         """Extract Bearer token from current request context."""
-        return getattr(_request_context, "auth_token", None)
+        return _request_auth_token.get()
 
-    def _create_tool_context_from_a2a(self, auth_token: str, tool_name: str, context_id: str = None) -> ToolContext:
+    def _create_tool_context_from_a2a(
+        self, auth_token: str | None, tool_name: str, context_id: str | None = None
+    ) -> ToolContext:
         """Create a ToolContext from A2A authentication information.
 
         Args:
-            auth_token: Bearer token from Authorization header
+            auth_token: Bearer token from Authorization header (optional)
             tool_name: Name of the tool being called
             context_id: Optional context ID for conversation tracking
 
@@ -140,7 +144,7 @@ class AdCPRequestHandler(RequestHandler):
         )
 
         # Get request headers for debugging (case-insensitive lookup)
-        headers = getattr(_request_context, "request_headers", {})
+        headers = _request_headers.get() or {}
 
         # Helper to get header case-insensitively
         def get_header(header_name: str) -> str | None:
@@ -260,7 +264,7 @@ class AdCPRequestHandler(RequestHandler):
             tool_name=tool_name,
             request_timestamp=datetime.now(UTC),
             metadata={"source": "a2a_server", "protocol": "a2a_jsonrpc"},
-            testing_context=TestingContext().model_dump(),  # Default testing context for A2A requests
+            testing_context=AdCPTestContext().model_dump(),  # Default testing context for A2A requests
         )
 
     def _log_a2a_operation(
@@ -317,6 +321,47 @@ class AdCPRequestHandler(RequestHandler):
         except Exception as e:
             # Don't fail the task if webhook fails
             logger.warning(f"Failed to send protocol-level webhook for task {task.id}: {e}")
+
+    def _reconstruct_response_object(self, skill_name: str, data: dict) -> Any:
+        """Reconstruct a response object from skill result data to call __str__().
+
+        Args:
+            skill_name: Name of the skill that produced the result
+            data: Dictionary containing the response data
+
+        Returns:
+            Reconstructed response object, or None if reconstruction fails
+        """
+        try:
+            # Map skill names to response classes
+            from src.core.schema_adapters import (
+                CreateMediaBuyResponse,
+                GetMediaBuyDeliveryResponse,
+                GetProductsResponse,
+                ListAuthorizedPropertiesResponse,
+                ListCreativeFormatsResponse,
+                ListCreativesResponse,
+                SyncCreativesResponse,
+                UpdateMediaBuyResponse,
+            )
+
+            response_map = {
+                "create_media_buy": CreateMediaBuyResponse,
+                "get_media_buy_delivery": GetMediaBuyDeliveryResponse,
+                "get_products": GetProductsResponse,
+                "list_authorized_properties": ListAuthorizedPropertiesResponse,
+                "list_creative_formats": ListCreativeFormatsResponse,
+                "list_creatives": ListCreativesResponse,
+                "sync_creatives": SyncCreativesResponse,
+                "update_media_buy": UpdateMediaBuyResponse,
+            }
+
+            response_class = response_map.get(skill_name)
+            if response_class:
+                return response_class(**data)
+        except Exception as e:
+            logger.debug(f"Could not reconstruct response object for {skill_name}: {e}")
+        return None
 
     async def on_message_send(
         self,
@@ -391,7 +436,7 @@ class AdCPRequestHandler(RequestHandler):
                 )
 
         # Prepare task metadata with both invocation types
-        task_metadata = {
+        task_metadata: dict[str, Any] = {
             "request_text": combined_text,
             "invocation_type": "explicit_skill" if skill_invocations else "natural_language",
         }
@@ -471,15 +516,27 @@ class AdCPRequestHandler(RequestHandler):
                         logger.error(f"Error in explicit skill {skill_name}: {e}")
                         results.append({"skill": skill_name, "error": str(e), "success": False})
 
-                # Create artifacts for all skill results
+                # Create artifacts for all skill results with human-readable descriptions
                 for i, res in enumerate(results):
                     artifact_data = res["result"] if res["success"] else {"error": res["error"]}
+
+                    # Generate human-readable description from response __str__()
+                    description = None
+                    if res["success"] and isinstance(artifact_data, dict):
+                        try:
+                            response_obj = self._reconstruct_response_object(res["skill"], artifact_data)
+                            if response_obj and hasattr(response_obj, "__str__"):
+                                description = str(response_obj)
+                        except Exception:
+                            pass  # If reconstruction fails, skip description
+
                     task.artifacts = task.artifacts or []
                     task.artifacts.append(
                         Artifact(
-                            artifactId=f"skill_result_{i+1}",
+                            artifact_id=f"skill_result_{i + 1}",
                             name=f"{'error' if not res['success'] else res['skill']}_result",
-                            parts=[Part(type="data", data=artifact_data)],
+                            description=description,  # Human-readable message
+                            parts=[Part(root=DataPart(data=artifact_data))],
                         )
                     )
 
@@ -564,7 +621,9 @@ class AdCPRequestHandler(RequestHandler):
                 )
                 task.artifacts = [
                     Artifact(
-                        artifactId="product_catalog_1", name="product_catalog", parts=[Part(type="data", data=result)]
+                        artifact_id="product_catalog_1",
+                        name="product_catalog",
+                        parts=[Part(root=DataPart(data=result))],
                     )
                 ]
             elif any(word in combined_text for word in ["price", "pricing", "cost", "cpm", "budget"]):
@@ -591,7 +650,9 @@ class AdCPRequestHandler(RequestHandler):
                 )
                 task.artifacts = [
                     Artifact(
-                        artifactId="pricing_info_1", name="pricing_information", parts=[Part(type="data", data=result)]
+                        artifact_id="pricing_info_1",
+                        name="pricing_information",
+                        parts=[Part(root=DataPart(data=result))],
                     )
                 ]
             elif any(word in combined_text for word in ["target", "audience"]):
@@ -620,7 +681,9 @@ class AdCPRequestHandler(RequestHandler):
                 )
                 task.artifacts = [
                     Artifact(
-                        artifactId="targeting_opts_1", name="targeting_options", parts=[Part(type="data", data=result)]
+                        artifact_id="targeting_opts_1",
+                        name="targeting_options",
+                        parts=[Part(root=DataPart(data=result))],
                     )
                 ]
             elif any(word in combined_text for word in ["create", "buy", "campaign", "media"]):
@@ -646,15 +709,17 @@ class AdCPRequestHandler(RequestHandler):
                 if result.get("success"):
                     task.artifacts = [
                         Artifact(
-                            artifactId="media_buy_1", name="media_buy_created", parts=[Part(type="data", data=result)]
+                            artifact_id="media_buy_1",
+                            name="media_buy_created",
+                            parts=[Part(root=DataPart(data=result))],
                         )
                     ]
                 else:
                     task.artifacts = [
                         Artifact(
-                            artifactId="media_buy_error_1",
+                            artifact_id="media_buy_error_1",
                             name="media_buy_error",
-                            parts=[Part(type="data", data=result)],
+                            parts=[Part(root=DataPart(data=result))],
                         )
                     ]
             else:
@@ -692,7 +757,9 @@ class AdCPRequestHandler(RequestHandler):
                 )
                 task.artifacts = [
                     Artifact(
-                        artifactId="capabilities_1", name="capabilities", parts=[Part(type="data", data=capabilities)]
+                        artifact_id="capabilities_1",
+                        name="capabilities",
+                        parts=[Part(root=DataPart(data=capabilities))],
                     )
                 ]
 
@@ -1116,7 +1183,7 @@ class AdCPRequestHandler(RequestHandler):
             logger.error(f"Error deleting push notification config: {e}")
             raise ServerError(InternalError(message=f"Failed to delete push notification config: {str(e)}"))
 
-    async def _handle_explicit_skill(self, skill_name: str, parameters: dict, auth_token: str) -> dict:
+    async def _handle_explicit_skill(self, skill_name: str, parameters: dict, auth_token: str | None) -> dict:
         """Handle explicit AdCP skill invocations.
 
         Maps skill names to appropriate handlers and validates parameters.
@@ -1209,21 +1276,19 @@ class AdCPRequestHandler(RequestHandler):
                 brief=brief, promoted_offering=promoted_offering, context=tool_context
             )
 
-            # Handle both dict and object responses (defensive pattern)
+            # Convert response to dict
             if isinstance(response, dict):
-                products = response.get("products", [])
-                message = response.get("message", "Products retrieved successfully")
-                products_list = products
+                response_data = response
             else:
-                products = response.products
-                message = str(response)  # Use __str__ method for human-readable message
-                products_list = [product.model_dump() for product in products]
+                response_data = response.model_dump()
 
-            # Convert to A2A response format
-            return {
-                "products": products_list,
-                "message": message,
-            }
+            # Add A2A protocol fields (message for human readability)
+            # Use __str__() method which all response types implement
+            response_data["message"] = (
+                str(response) if not isinstance(response, dict) else "Products retrieved successfully"
+            )
+
+            return response_data
 
         except Exception as e:
             logger.error(f"Error in get_products skill: {e}")
@@ -1264,7 +1329,16 @@ class AdCPRequestHandler(RequestHandler):
                     "message": f"Missing required AdCP parameters: {missing_params}",
                     "required_parameters": required_params,
                     "received_parameters": list(parameters.keys()),
-                    "error": "This endpoint only accepts AdCP v2.4 spec-compliant format. See https://adcontextprotocol.org/docs/",
+                    "errors": [
+                        {
+                            "code": "validation_error",
+                            "message": f"Missing required AdCP parameters: {missing_params}",
+                            "details": {
+                                "required": required_params,
+                                "received": list(parameters.keys()),
+                            },
+                        }
+                    ],
                 }
 
             # Call core function with AdCP spec-compliant parameters
@@ -1281,19 +1355,43 @@ class AdCPRequestHandler(RequestHandler):
                 context=tool_context,
             )
 
-            # Convert response to A2A format
-            # Use model_dump() to ensure all fields (including errors) are included
-            result = response.model_dump(exclude_none=False, mode="json")
+            # Convert response to dict and add A2A success wrapper
+            if isinstance(response, dict):
+                response_data = response
+            else:
+                response_data = response.model_dump()
 
-            # Add A2A-specific fields
-            result["success"] = response.errors is None or len(response.errors) == 0
-            result["message"] = str(response)  # Human-readable message via __str__
+            # Check if response contains errors (domain errors from validation/ad server)
+            has_errors = response_data.get("errors") and len(response_data.get("errors", [])) > 0
 
-            return result
+            # A2A wrapper adds success field and message
+            # Success is False if there are domain errors, even if no exception was raised
+            response_data["success"] = not has_errors
+            if has_errors:
+                response_data["message"] = "Media buy creation failed with validation errors"
+            else:
+                response_data["message"] = "Media buy created successfully"
+
+            return response_data
 
         except Exception as e:
             logger.error(f"Error in create_media_buy skill: {e}")
-            raise ServerError(InternalError(message=f"Failed to create media buy: {str(e)}"))
+            # Return error response instead of raising ServerError
+            # This allows tests to check error structure in artifacts
+            return {
+                "success": False,
+                "message": f"Failed to create media buy: {str(e)}",
+                "errors": [
+                    {
+                        "code": (
+                            "authentication_error"
+                            if "foreign key" in str(e).lower() and "principal" in str(e).lower()
+                            else "internal_error"
+                        ),
+                        "message": str(e),
+                    }
+                ],
+            }
 
     async def _handle_sync_creatives_skill(self, parameters: dict, auth_token: str) -> dict:
         """Handle explicit sync_creatives skill invocation (AdCP spec endpoint)."""
@@ -1325,16 +1423,24 @@ class AdCPRequestHandler(RequestHandler):
                 context=tool_context,
             )
 
-            # Convert response to A2A format (using AdCP spec field names)
-            # Convert response to A2A format
-            # Note: SyncCreativesResponse only contains domain data (creatives, dry_run)
-            # Protocol fields (status, task_id, etc.) are added by the A2A protocol layer
-            return {
-                "success": True,
-                "creatives": [result.model_dump() for result in response.creatives],
-                "dry_run": response.dry_run,
-                "message": str(response),  # Use __str__ method for human-readable message
-            }
+            # Convert response to dict
+            if isinstance(response, dict):
+                response_data = response
+            else:
+                response_data = response.model_dump()
+
+            # Add A2A protocol fields
+            # Check for errors in response
+            has_errors = response_data.get("errors") and len(response_data.get("errors", [])) > 0
+
+            response_data["success"] = not has_errors
+            response_data["message"] = (
+                "Creatives synced with errors"
+                if has_errors
+                else str(response) if not isinstance(response, dict) else "Creatives synced successfully"
+            )
+
+            return response_data
 
         except Exception as e:
             logger.error(f"Error in sync_creatives skill: {e}")
@@ -1366,32 +1472,19 @@ class AdCPRequestHandler(RequestHandler):
                 context=tool_context,
             )
 
-            # Handle both dict and object responses (defensive pattern)
+            # Convert response to dict
             if isinstance(response, dict):
-                creatives_list = response.get("creatives", [])
-                total_count = response.get("total_count", 0)
-                page = response.get("page", 1)
-                limit = response.get("limit", 50)
-                has_more = response.get("has_more", False)
-                message = response.get("message", "Creatives retrieved successfully")
+                response_data = response
             else:
-                creatives_list = [creative.model_dump() for creative in response.creatives]
-                total_count = response.query_summary.total_matching
-                page = response.pagination.current_page
-                limit = response.pagination.limit
-                has_more = response.pagination.has_more
-                message = str(response)  # Use __str__ method for human-readable message
+                response_data = response.model_dump()
 
-            # Convert response to A2A format
-            return {
-                "success": True,
-                "creatives": creatives_list,
-                "total_count": total_count,
-                "page": page,
-                "limit": limit,
-                "has_more": has_more,
-                "message": message,
-            }
+            # Add A2A protocol fields (message for human readability)
+            # Use __str__() method which all response types implement
+            response_data["message"] = (
+                str(response) if not isinstance(response, dict) else "Creatives listed successfully"
+            )
+
+            return response_data
 
         except Exception as e:
             logger.error(f"Error in list_creatives skill: {e}")
@@ -1623,43 +1716,19 @@ class AdCPRequestHandler(RequestHandler):
             # Call core function with request
             response = core_list_creative_formats_tool(req=req, context=tool_context)
 
-            # Handle both dict and object responses (core function may return either based on INCLUDE_SCHEMAS_IN_RESPONSES)
+            # Convert response to dict
             if isinstance(response, dict):
-                # Response is already a dict (schema enhancement enabled)
-                formats = response.get("formats", [])
-                message = response.get("message", "Creative formats retrieved successfully")
-                # Formats in dict are already serialized
-                formats_list = formats
+                response_data = response
             else:
-                # Response is ListCreativeFormatsResponse object
-                formats = response.formats
-                message = str(response)  # Use __str__ method for human-readable message
-                # Serialize Format objects to dicts
-                formats_list = [format_obj.model_dump() for format_obj in formats]
+                response_data = response.model_dump()
 
-            # Convert response to A2A format with schema validation
-            from src.core.schema_validation import INCLUDE_SCHEMAS_IN_RESPONSES, enhance_a2a_response_with_schema
+            # Add A2A protocol fields (message for human readability)
+            # Use __str__() method which all response types implement
+            response_data["message"] = (
+                str(response) if not isinstance(response, dict) else "Creative formats retrieved successfully"
+            )
 
-            a2a_response = {
-                "success": True,
-                "formats": formats_list,
-                "message": message,
-                "total_count": len(formats_list),
-                "specification_version": "AdCP v2.4",
-            }
-
-            # Add schema validation metadata for client validation
-            if INCLUDE_SCHEMAS_IN_RESPONSES:
-                from src.core.schemas import ListCreativeFormatsResponse
-
-                enhanced_response = enhance_a2a_response_with_schema(
-                    response_data=a2a_response,
-                    model_class=ListCreativeFormatsResponse,
-                    include_full_schema=False,  # Set to True for development debugging
-                )
-                return enhanced_response
-
-            return a2a_response
+            return response_data
 
         except Exception as e:
             logger.error(f"Error in list_creative_formats skill: {e}")
@@ -1689,7 +1758,7 @@ class AdCPRequestHandler(RequestHandler):
             else:
                 # No auth token - create minimal Context-like object with headers for tenant detection
                 # This allows tenant detection via Apx-Incoming-Host, Host, or x-adcp-tenant headers
-                headers = getattr(_request_context, "request_headers", {})
+                headers = _request_headers.get() or {}
 
                 # Create a simple object that quacks like a FastMCP Context
                 # get_principal_from_context() needs: context.meta["headers"] or context.headers
@@ -1707,20 +1776,13 @@ class AdCPRequestHandler(RequestHandler):
             # Context can be None for unauthenticated calls - tenant will be detected from headers
             response = core_list_authorized_properties_tool(req=request, context=tool_context)
 
-            # Handle both dict and object responses (defensive pattern)
-            # Per AdCP v2.4 spec, response has publisher_domains (not properties/tags)
+            # Return spec-compliant response (no extra fields)
+            # Per AdCP v2.4 spec: only publisher_domains, primary_channels, primary_countries,
+            # portfolio_description, advertising_policies, last_updated, and errors
             if isinstance(response, dict):
-                publisher_domains = response.get("publisher_domains", [])
+                return response
             else:
-                publisher_domains = response.publisher_domains
-
-            # Convert response to A2A format (using AdCP v2.4 spec fields)
-            return {
-                "success": True,
-                "publisher_domains": publisher_domains,
-                "message": f"Found {len(publisher_domains)} authorized publisher domains",
-                "total_count": len(publisher_domains),
-            }
+                return response.model_dump()
 
         except Exception as e:
             logger.error(f"Error in list_authorized_properties skill: {e}")
@@ -1764,19 +1826,12 @@ class AdCPRequestHandler(RequestHandler):
                 context=tool_context,
             )
 
-            # Convert response to A2A format (handle both Pydantic objects and dicts)
-            if hasattr(response, "model_dump"):
-                # Real Pydantic response object
-                result = response.model_dump(exclude_none=False, mode="json")
-                result["success"] = response.errors is None or len(response.errors) == 0
-                result["message"] = str(response)  # Human-readable message via __str__
+            # Return spec-compliant response (no extra fields)
+            # Per AdCP spec: all fields from UpdateMediaBuyResponse
+            if isinstance(response, dict):
+                return response
             else:
-                # Already a dict (from mock or legacy code)
-                result = response
-                if "success" not in result:
-                    result["success"] = result.get("errors") is None or len(result.get("errors", [])) == 0
-
-            return result
+                return response.model_dump()
 
         except Exception as e:
             logger.error(f"Error in update_media_buy skill: {e}")
@@ -1852,25 +1907,18 @@ class AdCPRequestHandler(RequestHandler):
                 context=tool_context,
             )
 
-            # Convert response to A2A format (handle both Pydantic objects and dicts)
-            if hasattr(response, "model_dump"):
-                # Real Pydantic response object
-                result = response.model_dump(exclude_none=False, mode="json")
-                result["success"] = response.errors is None or len(response.errors) == 0
-                result["message"] = str(response)  # Human-readable message via __str__
+            # Return spec-compliant response (no extra fields)
+            # Per AdCP spec: all fields from ProvidePerformanceFeedbackResponse
+            if isinstance(response, dict):
+                return response
             else:
-                # Already a dict (from mock or legacy code)
-                result = response
-                if "success" not in result:
-                    result["success"] = result.get("errors") is None or len(result.get("errors", [])) == 0
-
-            return result
+                return response.model_dump()
 
         except Exception as e:
             logger.error(f"Error in update_performance_index skill: {e}")
             raise ServerError(InternalError(message=f"Unable to update performance index: {str(e)}"))
 
-    async def _get_products(self, query: str, auth_token: str) -> dict:
+    async def _get_products(self, query: str, auth_token: str | None) -> dict:
         """Get available advertising products by calling core functions directly.
 
         Args:
@@ -2012,7 +2060,7 @@ class AdCPRequestHandler(RequestHandler):
             }
         }
 
-    async def _create_media_buy(self, request: str, auth_token: str) -> dict:
+    async def _create_media_buy(self, request: str, auth_token: str | None) -> dict:
         """Create a media buy based on the request.
 
         Args:
@@ -2215,6 +2263,18 @@ def main():
         extended_agent_card_url="/agent.json",
     )
 
+    # Add CORS middleware for browser compatibility (must be added early to wrap all responses)
+    from starlette.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Allow all origins for A2A protocol
+        allow_credentials=True,
+        allow_methods=["*"],  # Allow all HTTP methods
+        allow_headers=["*"],  # Allow all headers
+    )
+    logger.info("CORS middleware enabled for browser compatibility")
+
     # Override the agent card endpoints to support tenant-specific URLs
     def create_dynamic_agent_card(request) -> AgentCard:
         """Create agent card with tenant-specific URL from request headers."""
@@ -2265,12 +2325,26 @@ def main():
 
     async def dynamic_agent_discovery(request):
         """Override for /.well-known/agent.json with tenant-specific URL."""
+        from starlette.responses import Response
+
+        # Handle OPTIONS preflight requests (CORS middleware will add headers)
+        if request.method == "OPTIONS":
+            return Response(status_code=204)
+
         dynamic_card = create_dynamic_agent_card(request)
+        # CORS middleware automatically adds CORS headers
         return JSONResponse(dynamic_card.model_dump())
 
     async def dynamic_agent_card_endpoint(request):
         """Override for /agent.json with tenant-specific URL."""
+        from starlette.responses import Response
+
+        # Handle OPTIONS preflight requests (CORS middleware will add headers)
+        if request.method == "OPTIONS":
+            return Response(status_code=204)
+
         dynamic_card = create_dynamic_agent_card(request)
+        # CORS middleware automatically adds CORS headers
         return JSONResponse(dynamic_card.model_dump())
 
     # Find and replace the existing routes to ensure proper A2A specification compliance
@@ -2279,15 +2353,17 @@ def main():
         if hasattr(route, "path"):
             if route.path == "/.well-known/agent.json":
                 # Replace with our dynamic endpoint (legacy compatibility)
-                new_routes.append(Route("/.well-known/agent.json", dynamic_agent_discovery, methods=["GET"]))
+                new_routes.append(Route("/.well-known/agent.json", dynamic_agent_discovery, methods=["GET", "OPTIONS"]))
                 logger.info("Replaced /.well-known/agent.json with dynamic version")
             elif route.path == "/.well-known/agent-card.json":
                 # Replace with our dynamic endpoint (primary A2A discovery)
-                new_routes.append(Route("/.well-known/agent-card.json", dynamic_agent_discovery, methods=["GET"]))
+                new_routes.append(
+                    Route("/.well-known/agent-card.json", dynamic_agent_discovery, methods=["GET", "OPTIONS"])
+                )
                 logger.info("Replaced /.well-known/agent-card.json with dynamic version")
             elif route.path == "/agent.json":
                 # Replace with our dynamic endpoint
-                new_routes.append(Route("/agent.json", dynamic_agent_card_endpoint, methods=["GET"]))
+                new_routes.append(Route("/agent.json", dynamic_agent_card_endpoint, methods=["GET", "OPTIONS"]))
                 logger.info("Replaced /agent.json with dynamic version")
             else:
                 new_routes.append(route)
@@ -2430,23 +2506,22 @@ def main():
                     # Don't break - prefer Authorization if both present
 
             if token:
-                _request_context.auth_token = token
-                _request_context.request_headers = dict(request.headers)
+                _request_auth_token.set(token)
+                _request_headers.set(dict(request.headers))
                 logger.info(f"Extracted token from {auth_source} header for A2A request: {token[:10]}...")
             else:
                 logger.warning(
                     f"A2A request to {request.url.path} missing authentication (checked Authorization and x-adcp-auth headers)"
                 )
-                _request_context.auth_token = None
-                _request_context.request_headers = dict(request.headers)
+                _request_auth_token.set(None)
+                _request_headers.set(dict(request.headers))
 
         response = await call_next(request)
 
-        # Clean up thread-local storage
-        if hasattr(_request_context, "auth_token"):
-            delattr(_request_context, "auth_token")
-        if hasattr(_request_context, "request_headers"):
-            delattr(_request_context, "request_headers")
+        # Clean up context variables (ContextVars automatically clean up at context boundary,
+        # but explicit cleanup ensures no leakage between requests)
+        _request_auth_token.set(None)
+        _request_headers.set(None)
 
         return response
 

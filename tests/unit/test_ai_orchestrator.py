@@ -3,7 +3,6 @@
 Tests the AI's ability to interpret natural language test instructions.
 """
 
-import os
 from unittest.mock import patch
 
 import pytest
@@ -179,27 +178,19 @@ class TestPromptBuilding:
         assert "Example" in prompt
 
 
-class TestRealAIIntegration:
-    """Integration tests with real Gemini API (requires API key)."""
+class TestAIIntegration:
+    """Integration tests with mocked Gemini API."""
 
-    def test_interpret_simple_delay(self):
+    def test_interpret_simple_delay(self, mock_gemini_test_scenarios):
         """Test interpreting simple delay instruction."""
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key or api_key == "test_key_for_mocking":
-            pytest.skip("Real GEMINI_API_KEY not available in CI environment")
-
-        orchestrator = AITestOrchestrator()  # Uses env var
+        orchestrator = AITestOrchestrator(api_key="test_key")
         scenario = orchestrator.interpret_message("Wait 10 seconds before responding", "create_media_buy")
 
         assert scenario.delay_seconds == 10
 
-    def test_interpret_rejection(self):
+    def test_interpret_rejection(self, mock_gemini_test_scenarios):
         """Test interpreting rejection instruction."""
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key or api_key == "test_key_for_mocking":
-            pytest.skip("Real GEMINI_API_KEY not available in CI environment")
-
-        orchestrator = AITestOrchestrator()
+        orchestrator = AITestOrchestrator(api_key="test_key")
         scenario = orchestrator.interpret_message(
             "Reject this media buy with reason 'Budget too high'", "create_media_buy"
         )
@@ -207,13 +198,9 @@ class TestRealAIIntegration:
         assert scenario.should_reject is True
         assert "budget" in scenario.rejection_reason.lower() or "high" in scenario.rejection_reason.lower()
 
-    def test_interpret_hitl(self):
+    def test_interpret_hitl(self, mock_gemini_test_scenarios):
         """Test interpreting human-in-the-loop instruction."""
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key or api_key == "test_key_for_mocking":
-            pytest.skip("Real GEMINI_API_KEY not available in CI environment")
-
-        orchestrator = AITestOrchestrator()
+        orchestrator = AITestOrchestrator(api_key="test_key")
         scenario = orchestrator.interpret_message(
             "Simulate human in the loop approval after 2 minutes", "create_media_buy"
         )
@@ -221,39 +208,27 @@ class TestRealAIIntegration:
         assert scenario.simulate_hitl is True
         assert scenario.hitl_delay_minutes == 2
 
-    def test_interpret_creative_reject(self):
+    def test_interpret_creative_reject(self, mock_gemini_test_scenarios):
         """Test interpreting creative rejection."""
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key or api_key == "test_key_for_mocking":
-            pytest.skip("Real GEMINI_API_KEY not available in CI environment")
-
-        orchestrator = AITestOrchestrator()
+        orchestrator = AITestOrchestrator(api_key="test_key")
         scenario = orchestrator.interpret_message("reject this for missing click URL", "sync_creatives")
 
         assert len(scenario.creative_actions) >= 1
         assert scenario.creative_actions[0]["action"] == "reject"
         assert "url" in scenario.creative_actions[0].get("reason", "").lower()
 
-    def test_interpret_creative_approve(self):
+    def test_interpret_creative_approve(self, mock_gemini_test_scenarios):
         """Test interpreting creative approval."""
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key or api_key == "test_key_for_mocking":
-            pytest.skip("Real GEMINI_API_KEY not available in CI environment")
-
-        orchestrator = AITestOrchestrator()
+        orchestrator = AITestOrchestrator(api_key="test_key")
         scenario = orchestrator.interpret_message("approve this creative", "sync_creatives")
 
         # AI should approve (or return empty actions which defaults to approve)
         if scenario.creative_actions:
             assert scenario.creative_actions[0]["action"] == "approve"
 
-    def test_interpret_creative_ask_for_field(self):
+    def test_interpret_creative_ask_for_field(self, mock_gemini_test_scenarios):
         """Test interpreting creative field request."""
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key or api_key == "test_key_for_mocking":
-            pytest.skip("Real GEMINI_API_KEY not available in CI environment")
-
-        orchestrator = AITestOrchestrator()
+        orchestrator = AITestOrchestrator(api_key="test_key")
         scenario = orchestrator.interpret_message("ask for click tracker", "sync_creatives")
 
         assert len(scenario.creative_actions) >= 1

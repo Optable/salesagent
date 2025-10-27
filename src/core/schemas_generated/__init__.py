@@ -1,10 +1,10 @@
-# SCHEMA_HASH: 30c28c5ad94255a9b1e932b118ed1412
+# SCHEMA_HASH: 4bfd810a8a639e75ab9122954d3e8517
 """
 Auto-generated Pydantic models from AdCP JSON schemas.
 
 ⚠️  DO NOT EDIT FILES IN THIS DIRECTORY MANUALLY!
 
-Generated from: tests/e2e/schemas/v1/
+Generated from: schemas/v1/
 Generator: scripts/generate_schemas.py
 Tool: datamodel-code-generator + custom $ref resolution
 

@@ -121,7 +121,9 @@ class ContextManager(DatabaseManager):
             stmt = select(Context).filter_by(context_id=context_id)
             context = self.session.scalars(stmt).first()
             if context:
-                context.last_activity_at = datetime.now(UTC)
+                # TODO: Model uses Mapped[DateTime] but accepts datetime objects at runtime
+                # Should update model annotation to Mapped[datetime] for proper typing
+                context.last_activity_at = datetime.now(UTC)  # type: ignore[assignment]
                 self.session.commit()
         finally:
             # DatabaseManager handles session cleanup differently
@@ -185,7 +187,7 @@ class ContextManager(DatabaseManager):
         )
 
         if status == "completed":
-            step.completed_at = datetime.now(UTC)
+            step.completed_at = datetime.now(UTC)  # type: ignore[assignment]
 
         session = self.session
         try:
@@ -246,7 +248,7 @@ class ContextManager(DatabaseManager):
                 if status:
                     step.status = status
                     if status in ["completed", "failed"] and not step.completed_at:
-                        step.completed_at = datetime.now(UTC)
+                        step.completed_at = datetime.now(UTC)  # type: ignore[assignment]
 
                 if response_data is not None:
                     step.response_data = response_data
@@ -355,7 +357,7 @@ class ContextManager(DatabaseManager):
             # Detach all from session
             for step in steps:
                 session.expunge(step)
-            return steps
+            return list(steps)
         finally:
             session.close()
 
@@ -381,9 +383,9 @@ class ContextManager(DatabaseManager):
 
             lifecycle = []
             for mapping in mappings:
-                stmt = select(WorkflowStep).filter_by(step_id=mapping.step_id)
+                step_stmt = select(WorkflowStep).filter_by(step_id=mapping.step_id)
 
-                step = session.scalars(stmt).first()
+                step = session.scalars(step_stmt).first()
                 if step:
                     lifecycle.append(
                         {
@@ -393,8 +395,8 @@ class ContextManager(DatabaseManager):
                             "status": step.status,
                             "owner": step.owner,
                             "assigned_to": step.assigned_to,
-                            "created_at": step.created_at.isoformat() if step.created_at else None,
-                            "completed_at": step.completed_at.isoformat() if step.completed_at else None,
+                            "created_at": step.created_at.isoformat() if step.created_at else None,  # type: ignore[attr-defined]
+                            "completed_at": step.completed_at.isoformat() if step.completed_at else None,  # type: ignore[attr-defined]
                             "tool_name": step.tool_name,
                             "error_message": step.error_message,
                             "comments": step.comments,
@@ -428,7 +430,7 @@ class ContextManager(DatabaseManager):
                 context.conversation_history.append(
                     {"role": role, "content": content, "timestamp": datetime.now(UTC).isoformat()}
                 )
-                context.last_activity_at = datetime.now(UTC)
+                context.last_activity_at = datetime.now(UTC)  # type: ignore[assignment]
                 session.commit()
         finally:
             session.close()
@@ -511,7 +513,52 @@ class ContextManager(DatabaseManager):
             # Detach all from session
             for context in contexts:
                 session.expunge(context)
-            return contexts
+            return list(contexts)
+        finally:
+            session.close()
+
+    def link_workflow_to_object(
+        self,
+        step_id: str,
+        object_type: str,
+        object_id: str,
+        action: str | None = None,
+    ) -> None:
+        """Link a workflow step to an object after the step is created.
+
+        This is useful when you need to associate objects with a workflow step
+        after the step has already been created.
+
+        Args:
+            step_id: The workflow step ID
+            object_type: Type of object (media_buy, creative, product, etc.)
+            object_id: The object's ID
+            action: Optional action being performed (defaults to step_type)
+        """
+        session = self.session
+        try:
+            # Get the step to use its step_type as default action
+            stmt = select(WorkflowStep).filter_by(step_id=step_id)
+            step = session.scalars(stmt).first()
+
+            if not step:
+                console.print(f"[yellow]⚠️ Step {step_id} not found, cannot link object[/yellow]")
+                return
+
+            obj_mapping = ObjectWorkflowMapping(
+                object_type=object_type,
+                object_id=object_id,
+                step_id=step_id,
+                action=action or step.step_type,
+                created_at=datetime.now(UTC),
+            )
+            session.add(obj_mapping)
+            session.commit()
+            console.print(f"[green]✅ Linked {object_type} {object_id} to workflow step {step_id}[/green]")
+        except Exception as e:
+            session.rollback()
+            console.print(f"[red]Failed to link object to workflow: {e}[/red]")
+            raise
         finally:
             session.close()
 
@@ -537,8 +584,8 @@ class ContextManager(DatabaseManager):
                 return
 
             # Get context to find tenant_id
-            stmt = select(Context).filter_by(context_id=step.context_id)
-            context = session.scalars(stmt).first()
+            context_stmt = select(Context).filter_by(context_id=step.context_id)
+            context = session.scalars(context_stmt).first()
             if not context:
                 console.print(f"[yellow]No context found for step {step.step_id}[/yellow]")
                 return
@@ -549,12 +596,12 @@ class ContextManager(DatabaseManager):
             # Find registered webhooks for this principal
             # NOTE: PushNotificationConfig doesn't have object_type/object_id columns
             # Those are in ObjectWorkflowMapping which we already have via 'mappings'
-            stmt = select(PushNotificationConfig).filter_by(
+            webhook_stmt = select(PushNotificationConfig).filter_by(
                 tenant_id=tenant_id,
                 principal_id=principal_id,
                 is_active=True,
             )
-            webhooks = session.scalars(stmt).all()
+            webhooks = session.scalars(webhook_stmt).all()
 
             console.print(f"[cyan]🔍 Found {len(webhooks)} active webhook configs for principal {principal_id}[/cyan]")
 

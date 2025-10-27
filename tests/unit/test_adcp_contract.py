@@ -741,9 +741,13 @@ class TestAdCPContract:
         assert "currency" in adcp_response["pricing"], "pricing must have currency field"
         assert len(adcp_response["pricing"]["currency"]) == 3, "currency must be 3-letter code"
 
-        # Test backward compatibility properties
-        assert signal.signal_id == signal.signal_agent_segment_id, "signal_id property should work"
-        assert signal.type == signal.signal_type, "type property should work"
+        # Test backward compatibility properties (suppress deprecation warnings since we're testing them)
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            assert signal.signal_id == signal.signal_agent_segment_id, "signal_id property should work"
+            assert signal.type == signal.signal_type, "type property should work"
 
         # Test internal model_dump includes all fields
         internal_response = signal.model_dump_internal()
@@ -2431,24 +2435,27 @@ class TestAdCPContract:
         assert isinstance(request.brand_manifest, str)
 
     def test_get_signals_response_adcp_compliance(self):
-        """Test that GetSignalsResponse model complies with AdCP get-signals response schema."""
+        """Test that GetSignalsResponse model complies with AdCP get-signals response schema.
+
+        Per AdCP PR #113 and official schema, protocol fields (message, context_id)
+        are added by the protocol layer, not the domain response.
+        """
         from src.core.schema_adapters import GetSignalsResponse
 
-        # Minimal required fields (adcp_version removed from AdCP spec)
-        response = GetSignalsResponse(message="Found 0 signals", context_id="ctx_123", signals=[])
+        # Minimal required fields - only signals is required per AdCP spec
+        response = GetSignalsResponse(signals=[])
 
         # Convert to AdCP format (excludes internal fields)
         adcp_response = response.model_dump(exclude_none=True)
 
         # Verify required fields are present
-        assert "message" in adcp_response
-        assert "context_id" in adcp_response
         assert "signals" in adcp_response
 
-        # Verify field count (at least 3 core fields)
+        # Verify field count (signals is required, errors is optional)
+        # Per AdCP PR #113, protocol fields removed from domain responses
         assert (
-            len(adcp_response) >= 3
-        ), f"GetSignalsResponse should have at least 3 core fields, got {len(adcp_response)}"
+            len(adcp_response) >= 1
+        ), f"GetSignalsResponse should have at least 1 core field (signals), got {len(adcp_response)}"
 
         # Test with all fields
         signal_data = {
@@ -2461,12 +2468,8 @@ class TestAdCPContract:
             "deployments": [{"platform": "GAM", "is_live": True, "scope": "platform-wide"}],
             "pricing": {"cpm": 2.50, "currency": "USD"},
         }
-        full_response = GetSignalsResponse(
-            message="Found 1 signal",
-            context_id="ctx_456",
-            signals=[signal_data],
-            errors=None,
-        )
+        # Test with optional errors field
+        full_response = GetSignalsResponse(signals=[signal_data], errors=None)
         full_dump = full_response.model_dump(exclude_none=True)
         assert len(full_dump["signals"]) == 1
 

@@ -4,12 +4,14 @@ These tests verify that the dashboard works reliably after the architectural
 fixes, using single data source pattern and proper error handling.
 """
 
+from unittest.mock import patch
+
 import pytest
 
+from src.admin.services.dashboard_service import DashboardService
 from src.core.database.health_check import check_database_health
 
-# TODO: Fix failing tests and remove skip_ci (see GitHub issue #XXX)
-pytestmark = [pytest.mark.integration, pytest.mark.skip_ci]
+pytestmark = [pytest.mark.integration]
 
 
 class TestDashboardReliability:
@@ -164,16 +166,6 @@ class TestDashboardReliability:
         service = DashboardService("nonexistent_tenant")
         with pytest.raises(ValueError, match="not found"):
             service.get_dashboard_metrics()
-
-    @pytest.mark.requires_db
-    def test_migration_020_fix_creates_tables(self):
-        """Test that Migration 020 fix actually creates missing tables."""
-        # This test would ideally run the migration against a test database
-        # and verify tables are created, but we'll test the logic instead
-
-        # Skip this test since it's testing migration internals which are implementation details
-        # The actual functionality is tested through the dashboard service tests
-        pytest.skip("Migration 020 test skipped - testing migration internals is not necessary for functionality")
 
 
 class TestDashboardTemplateIntegration:
