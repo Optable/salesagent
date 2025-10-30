@@ -8,9 +8,12 @@ for Google Ad Manager campaigns.
 import base64
 import logging
 import random
+import time
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
+
+import requests
 
 from src.core.schemas import AssetStatus
 
@@ -160,18 +163,73 @@ class GAMCreativesManager:
         if not self.dry_run and line_item_service:
             statement = (
                 self.client_manager.get_statement_builder()
-                .where("orderId = :orderId")
-                .with_bind_variable("orderId", int(media_buy_id))
+                .Where("orderId = :orderId")
+                .WithBindVariable("orderId", int(media_buy_id))
             )
             response = line_item_service.getLineItemsByStatement(statement.ToStatement())
-            line_items = response.get("results", [])
-            line_item_map = {item["name"]: item["id"] for item in line_items}
+            line_items = getattr(response, "results", [])
+            logger.info(f"[DEBUG] Retrieved {len(line_items)} line items for order {media_buy_id}")
+
+            # Build map: GAM line item name → line item ID
+            gam_name_to_id = {getattr(item, "name"): getattr(item, "id") for item in line_items}
+
+            # Query database to get mapping: platform_line_item_id → package name
+            from src.core.database.database_session import get_db_session
+            from src.core.database.models import MediaPackage, Product
+            from sqlalchemy import select
+
+            line_item_id_to_package_name = {}
+            line_item_id_to_product_id = {}
+            with get_db_session() as session:
+                stmt = select(MediaPackage).where(MediaPackage.media_buy_id == media_buy_id)
+                media_packages = session.scalars(stmt).all()
+                for media_pkg in media_packages:
+                    config = media_pkg.package_config
+                    platform_line_item_id = config.get("platform_line_item_id")
+                    product_id = config.get("product_id")
+
+                    if platform_line_item_id and product_id:
+                        line_item_id_to_product_id[str(platform_line_item_id)] = product_id
+
+                # Now fetch product names
+                if line_item_id_to_product_id:
+                    product_ids = list(set(line_item_id_to_product_id.values()))
+                    stmt = select(Product).where(Product.product_id.in_(product_ids))
+                    products = session.scalars(stmt).all()
+                    product_id_to_name = {p.product_id: p.name for p in products}
+
+                    # Build final mapping: line_item_id → product name
+                    for line_item_id, product_id in line_item_id_to_product_id.items():
+                        package_name = product_id_to_name.get(product_id)
+                        if package_name:
+                            line_item_id_to_package_name[line_item_id] = package_name
+                            logger.info(f"[DEBUG] Mapped line item ID {line_item_id} → package name '{package_name}'")
+
+            # Build line_item_map: original package name → line item ID
+            line_item_map = {}
+            for gam_name, line_item_id in gam_name_to_id.items():
+                package_name = line_item_id_to_package_name.get(str(line_item_id))
+                if package_name:
+                    line_item_map[package_name] = line_item_id
+                    logger.info(f"[DEBUG] line_item_map['{package_name}'] = {line_item_id}")
 
             # Collect all creative placeholders from line items for size validation
+            # Key by original package name (not GAM line item name)
             creative_placeholders = {}
             for line_item in line_items:
-                package_name = line_item["name"]
-                placeholders = line_item.get("creativePlaceholders", [])
+                line_item_id = str(getattr(line_item, "id"))
+                gam_line_item_name = getattr(line_item, "name", "unknown")
+                package_name = line_item_id_to_package_name.get(line_item_id, gam_line_item_name)
+
+                placeholders = getattr(line_item, "creativePlaceholders", [])
+                logger.info(f"[DEBUG] Line item '{gam_line_item_name}' (package: '{package_name}') has {len(placeholders)} placeholders")
+                if placeholders:
+                    for ph in placeholders:
+                        size = getattr(ph, "size", None)
+                        if size:
+                            width = getattr(size, "width", "?")
+                            height = getattr(size, "height", "?")
+                            logger.info(f"[DEBUG]   - Placeholder: {width}x{height}")
                 creative_placeholders[package_name] = placeholders
         else:
             # In dry-run mode, create a mock line item map and placeholders
@@ -295,15 +353,20 @@ class GAMCreativesManager:
         for package_id in package_assignments:
             placeholders = creative_placeholders.get(package_id, [])
             for placeholder in placeholders:
-                placeholder_size = placeholder.get("size", {})
-                placeholder_width = placeholder_size.get("width", 0)
-                placeholder_height = placeholder_size.get("height", 0)
+                # SOAP objects don't support .get() - use getattr instead
+                placeholder_size = getattr(placeholder, "size", None)
+                if placeholder_size:
+                    placeholder_width = getattr(placeholder_size, "width", 0)
+                    placeholder_height = getattr(placeholder_size, "height", 0)
+                else:
+                    placeholder_width = 0
+                    placeholder_height = 0
 
                 # 1x1 placeholders are wildcards in GAM (native templates or programmatic)
                 # They accept creatives of any size
                 if placeholder_width == 1 and placeholder_height == 1:
                     matching_placeholders_found = True
-                    template_id = placeholder.get("creativeTemplateId")
+                    template_id = getattr(placeholder, "creativeTemplateId", None)
                     if template_id:
                         logger.info(
                             f"Creative {asset_width}x{asset_height} matches 1x1 placeholder "
@@ -329,9 +392,12 @@ class GAMCreativesManager:
             for package_id in package_assignments:
                 placeholders = creative_placeholders.get(package_id, [])
                 for placeholder in placeholders:
-                    size = placeholder.get("size", {})
+                    # SOAP objects don't support .get() - use getattr instead
+                    size = getattr(placeholder, "size", None)
                     if size:
-                        available_sizes.append(f"{size.get('width', 0)}x{size.get('height', 0)}")
+                        width = getattr(size, "width", 0)
+                        height = getattr(size, "height", 0)
+                        available_sizes.append(f"{width}x{height}")
 
             validation_errors.append(
                 f"Creative size {asset_width}x{asset_height} does not match any LineItem placeholders. "
@@ -435,6 +501,7 @@ class GAMCreativesManager:
                 "advertiserId": self.advertiser_id,
                 "size": {"width": width, "height": height},
                 "primaryImageAsset": uploaded_asset,
+                "destinationUrl": asset.get("click_url") or asset.get("click_through_url") or "https://example.com",
             }
         elif asset_type == "video":
             creative = {
@@ -525,7 +592,17 @@ class GAMCreativesManager:
         raise Exception("No HTML5 source content found in asset")
 
     def _upload_binary_asset(self, asset: dict[str, Any]) -> dict[str, Any] | None:
-        """Upload binary asset to GAM and return asset info."""
+        """Upload binary asset to GAM and return asset info.
+
+        Downloads the asset from URL and creates a CreativeAsset structure
+        with base64-encoded binary data for GAM API.
+
+        Args:
+            asset: Creative asset dictionary with content_uri/url/media_url
+
+        Returns:
+            CreativeAsset dictionary with assetByteArray for GAM API, or None if failed
+        """
         if self.dry_run:
             logger.info("Would upload binary asset to GAM")
             return {
@@ -535,10 +612,89 @@ class GAMCreativesManager:
                 "mimeType": self._get_content_type(asset),
             }
 
-        # Implementation would handle actual upload to GAM
-        # This is a simplified version
-        logger.warning("Binary asset upload not fully implemented")
-        return None
+        # GAM asset size limit: 10MB
+        MAX_ASSET_SIZE = 10 * 1024 * 1024  # 10MB in bytes
+
+        try:
+            # Get asset URL (content_uri is aliased to url in schemas)
+            asset_url = asset.get("url") or asset.get("content_uri") or asset.get("media_url")
+            if not asset_url:
+                logger.error("No URL found in asset for binary upload")
+                return None
+
+            logger.info(f"Downloading binary asset from: {asset_url}")
+
+            # Download the asset with proper headers and retry logic
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (compatible; AdCP-Sales-Agent/1.0; +https://adcontextprotocol.org/)'
+            }
+
+            # Retry logic: 3 attempts with exponential backoff
+            max_retries = 3
+            retry_delay = 1  # seconds
+            response = None
+
+            for attempt in range(max_retries):
+                try:
+                    response = requests.get(asset_url, headers=headers, timeout=30)
+                    response.raise_for_status()
+                    break  # Success, exit retry loop
+                except requests.RequestException as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Download attempt {attempt + 1} failed: {e}. Retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        raise  # Last attempt failed, re-raise exception
+
+            if not response:
+                logger.error("Failed to download asset after all retry attempts")
+                return None
+
+            binary_data = response.content
+            logger.info(f"Downloaded {len(binary_data)} bytes")
+
+            # Validate asset size
+            if len(binary_data) > MAX_ASSET_SIZE:
+                logger.error(f"Asset size {len(binary_data)} bytes exceeds GAM limit of {MAX_ASSET_SIZE} bytes (10MB)")
+                return None
+
+            # Base64 encode the binary data for GAM API
+            encoded_data = base64.b64encode(binary_data).decode('utf-8')
+
+            # Determine filename from URL or asset metadata
+            parsed_url = urlparse(asset_url)
+            filename = asset.get("name") or parsed_url.path.split("/")[-1] or "creative_asset"
+
+            # Ensure filename has extension
+            if not any(filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mov']):
+                # Add extension based on content type
+                content_type = response.headers.get('content-type', '').lower()
+                if 'jpeg' in content_type or 'jpg' in content_type:
+                    filename += '.jpg'
+                elif 'png' in content_type:
+                    filename += '.png'
+                elif 'gif' in content_type:
+                    filename += '.gif'
+                elif 'mp4' in content_type:
+                    filename += '.mp4'
+
+            # Create CreativeAsset structure for GAM API
+            # Note: assetByteArray must come before fileName (element ordering matters)
+            creative_asset = {
+                "assetByteArray": encoded_data,
+                "fileName": filename,
+            }
+
+            logger.info(f"Created CreativeAsset with {len(encoded_data)} bytes (base64) for file: {filename}")
+            return creative_asset
+
+        except requests.RequestException as e:
+            logger.error(f"Failed to download asset from {asset_url}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to create binary asset: {e}")
+            return None
 
     def _get_content_type(self, asset: dict[str, Any]) -> str:
         """Determine content type from asset."""

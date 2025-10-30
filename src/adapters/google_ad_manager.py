@@ -341,12 +341,18 @@ class GoogleAdManager(AdServerAdapter):
             for package in packages:
                 from sqlalchemy import select
 
+                # Use package.product_id to look up the product (not package.package_id which is generated)
+                product_id = package.product_id
+                if not product_id:
+                    continue  # Skip packages without product_id
+
                 stmt = select(Product).filter_by(
                     tenant_id=self.tenant_id,
-                    product_id=package.package_id,  # package_id is actually product_id
+                    product_id=product_id,
                 )
                 product = db_session.scalars(stmt).first()
                 if product:
+                    # Key by package.package_id so line items can look up by package
                     products_map[package.package_id] = {
                         "product_id": product.product_id,
                         "implementation_config": (

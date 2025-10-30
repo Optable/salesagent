@@ -1370,10 +1370,11 @@ class Creative(BaseModel):
     )
 
     # Internal fields (not in AdCP spec, but available for internal use)
-    principal_id: str  # Internal - not in AdCP spec
+    # These are optional in requests (client doesn't provide them), but required in responses (server populates them)
+    principal_id: str | None = None  # Internal - not in AdCP spec, server-populated
     group_id: str | None = None  # Internal - not in AdCP spec
-    created_at: datetime  # Internal timestamp
-    updated_at: datetime  # Internal timestamp
+    created_at: datetime | None = None  # Internal timestamp, server-populated
+    updated_at: datetime | None = None  # Internal timestamp, server-populated
     has_macros: bool | None = False  # Internal processing
     macro_validation: dict[str, Any] | None = None  # Internal processing
     asset_mapping: dict[str, str] | None = Field(default_factory=dict)  # Internal mapping

@@ -95,8 +95,8 @@ class GAMClientManager:
         Returns:
             StatementBuilder instance
         """
-        client = self.get_client()
-        return client.GetService("StatementBuilder", version="v202411")
+        from googleads import ad_manager
+        return ad_manager.StatementBuilder(version="v202411")
 
     def is_connected(self) -> bool:
         """Check if client is connected and working.

@@ -1429,11 +1429,16 @@ async def _create_media_buy_impl(
 
                     logger.info(f"[DEBUG] Package {i}: Using package_id = {package_id}")
 
+                    # Get product_id from request package (adapter response doesn't include it)
+                    req_package = packages[i] if i < len(packages) else None
+                    product_id = req_package.product_id if req_package else resp_package.get("product_id")
+
                     # Store full package config as JSON
                     package_config = {
                         "package_id": package_id,
                         "name": resp_package.get("name"),  # Include package name from adapter response
-                        "product_id": resp_package.get("product_id"),
+                        "product_id": product_id,  # From request package
+                        "platform_line_item_id": resp_package.get("platform_line_item_id"),  # GAM line item ID
                         "budget": resp_package.get("budget"),
                         "targeting_overlay": resp_package.get("targeting_overlay"),
                         "creative_ids": resp_package.get("creative_ids"),
@@ -1580,7 +1585,9 @@ async def _create_media_buy_impl(
             assets = []
             for creative in req.creatives:
                 try:
-                    asset = _convert_creative_to_adapter_asset(creative, req.product_ids)
+                    # Use creative's package_assignments if available, otherwise empty list
+                    package_assignments = creative.package_assignments if creative.package_assignments else []
+                    asset = _convert_creative_to_adapter_asset(creative, package_assignments)
                     assets.append(asset)
                 except Exception as e:
                     console.print(f"[red]Error converting creative {creative.creative_id}: {e}[/red]")
@@ -1616,9 +1623,11 @@ async def _create_media_buy_impl(
                 logger.warning(f"Adapter returned fewer packages than request. Using request package {i}")
                 response_package_dict = {}
 
-            # CRITICAL: Save package_id from adapter response BEFORE merge
+            # CRITICAL: Save package_id and platform_line_item_id from adapter response BEFORE merge
             adapter_package_id = response_package_dict.get("package_id")
+            adapter_line_item_id = response_package_dict.get("platform_line_item_id")
             logger.info(f"[DEBUG] Package {i}: adapter_package_id from response = {adapter_package_id}")
+            logger.info(f"[DEBUG] Package {i}: adapter_line_item_id from response = {adapter_line_item_id}")
 
             # Serialize the request package to get fields like buyer_ref, format_ids
             if hasattr(package, "model_dump_internal"):
@@ -1640,6 +1649,11 @@ async def _create_media_buy_impl(
                 error_msg = f"Adapter did not return package_id for package {i}. Cannot build response."
                 logger.error(error_msg)
                 raise ValueError(error_msg)
+
+            # CRITICAL: Restore platform_line_item_id from adapter if present (needed for creative association)
+            if adapter_line_item_id:
+                package_dict["platform_line_item_id"] = adapter_line_item_id
+                logger.info(f"[DEBUG] Package {i}: Preserved platform_line_item_id = {adapter_line_item_id}")
 
             # Validate and convert format_ids (request field) to format_ids_to_provide (response field)
             if "format_ids" in package_dict and package_dict["format_ids"]:

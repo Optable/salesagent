@@ -141,8 +141,10 @@ class GAMOrdersManager:
             statement = statement_builder.ToStatement()
 
             result = order_service.getOrdersByStatement(statement)
-            if result and result.get("results"):
-                return result["results"][0].get("status", "UNKNOWN")
+            results = getattr(result, "results", None) if result else None
+            if results:
+                first_order = results[0]
+                return getattr(first_order, "status", "UNKNOWN")
             else:
                 return "NOT_FOUND"
         except Exception as e:
@@ -178,7 +180,7 @@ class GAMOrdersManager:
 
             result = order_service.performOrderAction(archive_action, statement)
 
-            if result and result.get("numChanges", 0) > 0:
+            if result and getattr(result, "numChanges", 0) > 0:
                 logger.info(f"✓ Successfully archived GAM Order {order_id}")
                 return True
             else:
@@ -211,7 +213,7 @@ class GAMOrdersManager:
             statement = statement_builder.ToStatement()
 
             result = lineitem_service.getLineItemsByStatement(statement)
-            return result.get("results", [])
+            return getattr(result, "results", [])
         except Exception as e:
             logger.error(f"Error getting line items for order {order_id}: {e}")
             return []
@@ -229,7 +231,7 @@ class GAMOrdersManager:
         guaranteed_types = []
 
         for line_item in line_items:
-            line_item_type = line_item.get("lineItemType")
+            line_item_type = getattr(line_item, "lineItemType", None)
             if line_item_type in GUARANTEED_LINE_ITEM_TYPES:
                 guaranteed_types.append(line_item_type)
 
@@ -393,10 +395,15 @@ class GAMOrdersManager:
                 # Validate format types against product supported types
                 supported_format_types = impl_config.get("supported_format_types", ["display", "video", "native"])
 
-                for format_id in package.format_ids:
+                for format_id_obj in package.format_ids:
                     # Use format resolver to support custom formats and product overrides
                     try:
-                        format_obj = get_format(format_id, tenant_id=tenant_id, product_id=package.package_id)
+                        # Extract format ID string from FormatId object (AdCP v2.4)
+                        format_id = format_id_obj.id if hasattr(format_id_obj, 'id') else str(format_id_obj)
+                        agent_url = format_id_obj.agent_url if hasattr(format_id_obj, 'agent_url') else None
+
+                        # Use package.product_id (actual product ID), not package.package_id (generated package ID)
+                        format_obj = get_format(format_id, agent_url=agent_url, tenant_id=tenant_id, product_id=package.product_id)
                     except ValueError as e:
                         error_msg = f"Format lookup failed for '{format_id}': {e}"
                         log(f"[red]Error: {error_msg}[/red]")
