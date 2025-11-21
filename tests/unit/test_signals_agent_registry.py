@@ -1,5 +1,6 @@
 """Unit tests for signals agent registry (adcp v1.0.1 migration)."""
 
+import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -249,3 +250,33 @@ class TestSignalsAgentRegistry:
             assert result["success"] is False
             assert "error" in result
             assert "Authentication" in result["error"] or "failed" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_test_connection_propagates_cancelled_error(self):
+        """Test test_connection propagates asyncio.CancelledError (by design).
+
+        This demonstrates that CancelledError propagates from the async method,
+        which is why the admin UI needs to catch it when using asyncio.run().
+        """
+        registry = SignalsAgentRegistry()
+
+        agent_url = "https://test-agent.example.com/mcp"
+        auth = {"type": "bearer", "credentials": "test-token"}
+        auth_header = "Authorization"
+
+        # Mock to raise CancelledError during cleanup
+        with (
+            patch.object(registry, "_build_adcp_client") as mock_build,
+            patch.object(registry, "_get_signals_from_agent") as mock_get_signals,
+        ):
+            # Mock client that supports async context manager but raises CancelledError on exit
+            mock_client = AsyncMock()
+            mock_client.__aenter__.return_value = mock_client
+            mock_client.__aexit__.side_effect = asyncio.CancelledError("Cleanup cancelled")
+            mock_build.return_value = mock_client
+
+            mock_get_signals.return_value = [{"signal_agent_segment_id": "test"}]
+
+            # CancelledError should propagate (this is expected behavior)
+            with pytest.raises(asyncio.CancelledError, match="Cleanup cancelled"):
+                await registry.test_connection(agent_url, auth=auth, auth_header=auth_header)
